@@ -7,10 +7,11 @@
 
     let timeoutID: number = 0;
     let start: boolean = $state(false);
+    let textMessage: string = $state('');
 
     function startMessaging() {
         start = true;
-        socket = new WebSocket(`ws://${location.hostname}/ws`);
+        socket = new WebSocket(`ws://${location.hostname}:3000/ws`);
         socket.addEventListener('open', function (event) {
             socket.send('Hello Server!');
         });
@@ -41,6 +42,20 @@
 
     function clearMessages() {
         messages = []
+    }
+
+    function sentMessage() {
+        if (socket) {
+            // const obj = { message: textMessage };
+            // const blob = new Blob([JSON.stringify(obj, null, 2)], {
+            //     type: "application/json",
+            // });
+            socket.send(textMessage);
+            textMessage = ''
+        } else {
+            messages.push('WebSocket is closed')
+        }
+       
     }
 
 	onMount(() => {
@@ -80,4 +95,8 @@
             {/each}
         </div>
     </div>
+        <div class="flex flex-row gap-2 mt-4">
+                <textarea class="border-2" rows="4" cols="58" bind:value={textMessage} ></textarea>
+                <button class="bg-orange-300 rounded-md p-2 text-orange-700 font-bold min-w-16" onclick={() => sentMessage()}>Sent</button>
+        </div>
 </div>
