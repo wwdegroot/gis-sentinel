@@ -1,5 +1,8 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::IntoResponse,
 };
 use axum_extra::TypedHeader;
@@ -13,7 +16,6 @@ use axum::extract::ws::CloseFrame;
 use tracing::{debug, error, info};
 //allows to split the websocket stream into separate TX and RX branches
 use futures::{sink::SinkExt, stream::StreamExt};
-
 
 /// The handler for the HTTP request (this gets called when the HTTP GET lands at the start
 /// of websocket negotiation). After this completes, the actual switching from HTTP to
@@ -30,7 +32,7 @@ pub async fn ws_handler(
     } else {
         String::from("Unknown browser")
     };
-    println!("`{user_agent}` at {addr} connected.");
+    debug!("`{user_agent}` at {addr} connected.");
     // finalize the upgrade process by returning upgrade callback.
     // we can customize the callback by sending additional info such as address.
     ws.on_upgrade(move |socket| handle_socket(socket, addr))
@@ -40,9 +42,9 @@ pub async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
     // send a ping (unsupported by some browsers) just to kick things off and get a response
     if socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
-        println!("Pinged {who}...");
+        debug!("Pinged {who}...");
     } else {
-        println!("Could not send ping {who}!");
+        debug!("Could not send ping {who}!");
         // no Error here since the only thing we can do is to close the connection.
         // If we can not send messages, there is no way to salvage the statemachine anyway.
         return;
@@ -58,7 +60,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
                 return;
             }
         } else {
-            println!("client {who} abruptly disconnected");
+            error!("client {who} abruptly disconnected");
             return;
         }
     }
@@ -73,7 +75,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
             .await
             .is_err()
         {
-            println!("client {who} abruptly disconnected");
+            error!("client {who} abruptly disconnected");
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -107,7 +109,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
             })))
             .await
         {
-            println!("Could not send Close due to {e}, probably it is ok?");
+            debug!("Could not send Close due to {e}, probably it is ok?");
         }
         n_msg
     });
@@ -129,22 +131,22 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
     tokio::select! {
         rv_a = (&mut send_task) => {
             match rv_a {
-                Ok(a) => println!("{a} messages sent to {who}"),
-                Err(a) => println!("Error sending messages {a:?}")
+                Ok(a) => info!("{a} messages sent to {who}"),
+                Err(a) => error!("Error sending messages {a:?}")
             }
             recv_task.abort();
         },
         rv_b = (&mut recv_task) => {
             match rv_b {
-                Ok(b) => println!("Received {b} messages"),
-                Err(b) => println!("Error receiving messages {b:?}")
+                Ok(b) => info!("Received {b} messages"),
+                Err(b) => error!("Error receiving messages {b:?}")
             }
             send_task.abort();
         }
     }
 
     // returning from the handler closes the websocket connection
-    println!("Websocket context {who} destroyed");
+    info!("Websocket context {who} destroyed");
 }
 
 /// helper to print contents of messages to stdout. Has special treatment for Close.
@@ -180,4 +182,3 @@ fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
     }
     ControlFlow::Continue(())
 }
-

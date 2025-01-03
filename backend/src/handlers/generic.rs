@@ -8,7 +8,7 @@ use rust_embed::Embed;
 static INDEX_HTML: &str = "index.html";
 // Embed sveltekit build files in binary
 #[derive(Embed)]
-#[folder = "../frontend/build/"]
+#[folder = r"..\frontend\build\"]
 struct Assets;
 
 pub async fn static_handler(uri: Uri) -> impl IntoResponse {

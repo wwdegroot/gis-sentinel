@@ -1,29 +1,10 @@
-//! Example websocket server.
-//!
-//! Run the server with
-//! ```not_rust
-//! cargo run -p example-websockets --bin example-websockets
-//! ```
-//!
-//! Run a browser client with
-//! ```not_rust
-//! firefox http://localhost:3000
-//! ```
-//!
-//! Alternatively you can run the rust client (showing two
-//! concurrent websocket connections being established) with
-//! ```not_rust
-//! cargo run -p example-websockets --bin example-client
-//! ```
 pub mod handlers;
 pub mod schema;
 use crate::handlers::{
-    generic::static_handler,
-    websockets::ws_handler,
-    sentinel_ws::ws_sentinel_handler,
+    generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
 };
 
-use axum::extract::ws::{Message};
+use axum::extract::ws::Message;
 use axum::routing::{get, Router};
 use schema::{AlertType, SentinelAlert};
 use std::net::SocketAddr;
@@ -40,7 +21,6 @@ pub struct AppState {
     broadcast_tx: Arc<Mutex<Sender<Message>>>,
     broadcast_rx: Arc<Mutex<Receiver<Message>>>,
     active_alerts: Arc<Mutex<Vec<SentinelAlert>>>,
-
 }
 
 #[tokio::main]
@@ -56,9 +36,27 @@ async fn main() {
     // share state
     let (tx, rx) = broadcast::channel(32);
     let active_alerts: Vec<SentinelAlert> = vec![
-        SentinelAlert{ id: "1".to_string(), atype: AlertType::New, name: "test1".to_string(), performance: 300, expected: 150, up: true, reason: "slow performance".to_string(), error: None},
-        SentinelAlert{ id: "2".to_string(), atype: AlertType::New, name: "test2".to_string(), performance: 150, expected: 150, up: false, reason: "service down".to_string(), error: None},
-        ];
+        SentinelAlert {
+            id: "1".to_string(),
+            atype: AlertType::New,
+            name: "test1".to_string(),
+            performance: 300,
+            expected: 150,
+            up: true,
+            reason: "slow performance".to_string(),
+            error: None,
+        },
+        SentinelAlert {
+            id: "2".to_string(),
+            atype: AlertType::New,
+            name: "test2".to_string(),
+            performance: 150,
+            expected: 150,
+            up: false,
+            reason: "service down".to_string(),
+            error: None,
+        },
+    ];
     let app = AppState {
         broadcast_tx: Arc::new(Mutex::new(tx)),
         broadcast_rx: Arc::new(Mutex::new(rx)),
@@ -68,7 +66,8 @@ async fn main() {
     let app = Router::new()
         .fallback(static_handler)
         .route("/ws", get(ws_handler))
-        .route("/ws/sentinel", get(ws_sentinel_handler)).with_state(app)
+        .route("/ws/sentinel", get(ws_sentinel_handler))
+        .with_state(app)
         // logging so we can see whats going on
         .layer(
             TraceLayer::new_for_http()

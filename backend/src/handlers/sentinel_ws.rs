@@ -1,19 +1,19 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::IntoResponse,
 };
 use axum_extra::TypedHeader;
-use tokio::sync::broadcast::error::RecvError;
 use std::net::SocketAddr;
+use tokio::sync::broadcast::error::RecvError;
 //allows to extract the IP of connecting user
 use axum::extract::connect_info::ConnectInfo;
 use tracing::{debug, error, info};
 //allows to split the websocket stream into separate TX and RX branches
-use futures::{sink::SinkExt, stream::StreamExt};
 use crate::AppState;
-
-
-
+use futures::{sink::SinkExt, stream::StreamExt};
 
 pub async fn ws_sentinel_handler(
     ws: WebSocketUpgrade,
@@ -26,7 +26,7 @@ pub async fn ws_sentinel_handler(
     } else {
         String::from("Unknown browser")
     };
-    println!("`{user_agent}` at {addr} connected.");
+    debug!("`{user_agent}` at {addr} connected.");
     ws.on_upgrade(move |socket| handle_sentinel_socket(socket, addr, State(app)))
 }
 
@@ -34,7 +34,7 @@ pub async fn ws_sentinel_handler(
 async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): State<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = app.broadcast_tx.lock().await.subscribe();
-    
+
     // sent active alerts to client
     for alert in app.active_alerts.lock().await.iter() {
         let data = serde_json::to_string(alert).expect("Valid SentinelAlert data");
@@ -72,14 +72,19 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
             }
         }
     });
-        
+
     // Spawn a task to handle incoming messages from the client and echo them back.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(t) => {
                     info!("Client sent: {}", t);
-                    if let Err(e) = app.broadcast_tx.lock().await.send(format!("Echo: {}", t).into()) {
+                    if let Err(e) = app
+                        .broadcast_tx
+                        .lock()
+                        .await
+                        .send(format!("Echo: {}", t).into())
+                    {
                         error!("Could not send message to broadcast channel: {}", e);
                     }
                 }
