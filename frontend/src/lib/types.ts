@@ -1,12 +1,12 @@
 enum AlertType {
-    Update = "Update",
-    New = "New",
-    Remove = "Remove",
+    Update = 'Update',
+    New = 'New',
+    Remove = 'Remove'
 }
 
 interface SentinelAlert {
     id: string;
-    atype: AlertType,
+    atype: AlertType;
     name: string;
     performance: number;
     expected: number;
@@ -15,4 +15,4 @@ interface SentinelAlert {
     error?: string;
 }
 
-export type { SentinelAlert, AlertType }
+export type { SentinelAlert, AlertType };
