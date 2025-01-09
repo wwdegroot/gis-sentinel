@@ -13,8 +13,6 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use crate::AppState;
 
 
-
-
 pub async fn ws_sentinel_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
