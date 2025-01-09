@@ -8,7 +8,7 @@ pub enum AlertType {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SentinelAlert{
+pub struct SentinelAlert {
     pub id: String,
     pub name: String,
     pub atype: AlertType,
@@ -16,5 +16,5 @@ pub struct SentinelAlert{
     pub expected: i32,
     pub up: bool,
     pub reason: String,
-    pub error: Option<String>
+    pub error: Option<String>,
 }
