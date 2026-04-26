@@ -1,12 +1,12 @@
 use axum::{
+    body::Bytes,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
 };
 use axum_extra::TypedHeader;
-use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 
@@ -41,7 +41,11 @@ pub async fn ws_handler(
 /// Actual websocket statemachine (one will be spawned per connection)
 async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
     // send a ping (unsupported by some browsers) just to kick things off and get a response
-    if socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
+    if socket
+        .send(Message::Ping(Bytes::from_static(&[1, 2, 3])))
+        .await
+        .is_ok()
+    {
         debug!("Pinged {who}...");
     } else {
         debug!("Could not send ping {who}!");
@@ -71,7 +75,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
     // connecting to server and receiving their greetings.
     for i in 1..5 {
         if socket
-            .send(Message::Text(format!("Hi {i} times!")))
+            .send(Message::Text(format!("Hi {i} times!").into()))
             .await
             .is_err()
         {
@@ -91,7 +95,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
         for i in 0..n_msg {
             // In case of any websocket error, we exit.
             if sender
-                .send(Message::Text(format!("Server message {i} ...")))
+                .send(Message::Text(format!("Server message {i} ...").into()))
                 .await
                 .is_err()
             {
@@ -105,7 +109,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
         if let Err(e) = sender
             .send(Message::Close(Some(CloseFrame {
                 code: axum::extract::ws::close_code::NORMAL,
-                reason: Cow::from("Goodbye"),
+                reason: Utf8Bytes::from_static("Goodbye"),
             })))
             .await
         {

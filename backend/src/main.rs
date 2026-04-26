@@ -1,9 +1,11 @@
+pub mod config;
 pub mod handlers;
 pub mod schema;
+use crate::config::Config;
 use crate::handlers::{
     generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
 };
-
+use anyhow::Result;
 use axum::extract::ws::Message;
 use axum::routing::{get, Router};
 use schema::{AlertType, SentinelAlert};
@@ -24,7 +26,7 @@ pub struct AppState {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -33,6 +35,9 @@ async fn main() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+    // load config
+    let config = Config::load();
+
     // share state
     let (tx, rx) = broadcast::channel(32);
     let active_alerts: Vec<SentinelAlert> = vec![
@@ -75,14 +80,13 @@ async fn main() {
         );
 
     // run it with hyper
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    let addr = config.bind_addr();
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::debug!("listening on {addr}");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
