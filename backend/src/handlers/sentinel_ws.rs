@@ -7,6 +7,7 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use tokio::sync::broadcast::error::RecvError;
 //allows to extract the IP of connecting user
 use axum::extract::connect_info::ConnectInfo;
@@ -35,6 +36,9 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
     let (mut sender, mut receiver) = socket.split();
     let mut rx = app.broadcast_tx.lock().await.subscribe();
 
+    // Clone shutdown_flag for use in the select! loops
+    let shutdown_flag_send = app.shutdown_flag.clone();
+
     // sent active alerts to client
     for alert in app.active_alerts.lock().await.iter() {
         let data = serde_json::to_string(alert).expect("Valid SentinelAlert data");
@@ -48,6 +52,12 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
     let mut send_task = tokio::spawn(async move {
         // check for new notifications and sent them
         loop {
+            // Check shutdown flag before waiting for messages
+            if shutdown_flag_send.load(Ordering::SeqCst) {
+                debug!("Shutdown signal received in send task for {who}");
+                break;
+            }
+
             tokio::select! {
                 result = rx.recv() => {
                     match result {
@@ -68,45 +78,70 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
                         }
                     }
                 }
-                else => break
             }
+        }
+
+        // Send graceful close before exiting
+        if sender
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::NORMAL,
+                reason: "Server shutting down".into(),
+            })))
+            .await
+            .is_err()
+        {
+            debug!("Could not send close frame to {who} during shutdown");
         }
     });
-
+    // Clone shutdown_flag for use in the select! loops
+    let shutdown_flag_recv = app.shutdown_flag.clone();
     // Spawn a task to handle incoming messages from the client and echo them back.
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            match msg {
-                Message::Text(t) => {
-                    info!("Client sent: {}", t);
-                    if let Err(e) = app
-                        .broadcast_tx
-                        .lock()
-                        .await
-                        .send(format!("Echo: {}", t).into())
-                    {
-                        error!("Could not send message to broadcast channel: {}", e);
+        loop {
+            // Check shutdown flag before waiting for messages
+            if shutdown_flag_recv.load(Ordering::SeqCst) {
+                debug!("Shutdown signal received in recv task for {who}");
+                break;
+            }
+
+            if let Some(Ok(msg)) = receiver.next().await {
+                match msg {
+                    Message::Text(t) => {
+                        info!("Client sent: {}", t);
+                        if let Err(e) = app
+                            .broadcast_tx
+                            .lock()
+                            .await
+                            .send(format!("Echo: {}", t).into())
+                        {
+                            error!("Could not send message to broadcast channel: {}", e);
+                        }
                     }
+                    Message::Close(_) => {
+                        debug!("Client closed connection");
+                        break;
+                    }
+                    _ => {}
                 }
-                Message::Close(_) => {
-                    debug!("Client closed connection");
-                    break;
-                }
-                _ => {}
+            } else {
+                // Stream ended (client disconnected)
+                break;
             }
         }
-        debug!("Receive task finished");
+        debug!("Receive task finished for {who}");
     });
 
     // If any one of the tasks exit, abort the other.
     tokio::select! {
         _ = (&mut send_task) => {
-            debug!("Send task exited");
+            debug!("Send task exited for {who}");
             recv_task.abort();
         },
         _ = (&mut recv_task) => {
-            debug!("Receive task exited");
+            debug!("Receive task exited for {who}");
             send_task.abort();
         }
     };
+
+    info!("Sentinel WebSocket connection closed for {who}");
 }
