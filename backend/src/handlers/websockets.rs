@@ -1,9 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{
-        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-        State,
-    },
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
 };
 use axum_extra::TypedHeader;
