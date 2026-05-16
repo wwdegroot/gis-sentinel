@@ -11,11 +11,11 @@ The backend is an Axum-based Rust application serving two WebSocket endpoints (`
 ### 1. Remove Dead / Demo Code
 - **File:** `src/handlers/websockets.rs` — This entire file is copied from the Axum example. The `/ws` endpoint sends hardcoded "Hi X times!" and "Server message X..." messages. It doesn't use `AppState` at all (unused parameters trigger warnings). Decide: either integrate it meaningfully or delete it entirely.
 
-### 2. Hardcoded Bind Address & Crashing `.unwrap()` Calls
+### 2. FIXED: Hardcoded Bind Address & Crashing `.unwrap()` Calls
 - **File:** `src/main.rs:L63-L64` — `tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap()` will crash if the port is in use or binding fails. Same for the tracing subscriber init on L35.
-- **Fix:** Use environment variables or a config file for the bind address/port, and propagate errors instead of unwrapping.
+- **Fix:** Use environment variables or a config file for the bind address/port, and propagate errors instead of unwrapping. 
 
-### 3. No Configuration Management
+### 3. FIXED: No Configuration Management
 - Port, host, CORS origins, alert thresholds — everything is hardcoded.
 - **Fix:** Introduce a `Config` struct loaded from `.env` (using `dotenvy`) or a TOML/JSON config file with sensible defaults.
 
@@ -28,7 +28,7 @@ The backend is an Axum-based Rust application serving two WebSocket endpoints (`
   struct Assets;
   ```
 
-### 5. No Graceful Shutdown
+### 5. FIXED: No Graceful Shutdown
 - **File:** `src/main.rs` — When the process receives SIGINT/SIGTERM, connections are dropped abruptly.
 - **Fix:** Use `tokio::signal` to catch shutdown signals and call `server.with_graceful_shutdown(...)` to drain active WebSocket connections.
 
