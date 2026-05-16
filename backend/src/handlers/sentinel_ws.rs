@@ -34,13 +34,16 @@ pub async fn ws_sentinel_handler(
 /// Actual websocket statemachine (one will be spawned per connection)
 async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): State<AppState>) {
     let (mut sender, mut receiver) = socket.split();
-    let mut rx = app.broadcast_tx.lock().await.subscribe();
+    let mut rx = app.broadcast_tx.subscribe();
+    let shutdown_token = app.shutdown_token.clone();
 
-    // Clone shutdown_flag for use in the select! loops
-    let shutdown_flag_send = app.shutdown_flag.clone();
-
+    // -- Write message to channel
+    // This will temporarily block readers until the write is finished
+    // let mut alerts = app.active_alerts.write().await;
+    // alerts.push(new_alert);
+    //
     // sent active alerts to client
-    for alert in app.active_alerts.lock().await.iter() {
+    for alert in app.active_alerts.read().await.iter() {
         let data = serde_json::to_string(alert).expect("Valid SentinelAlert data");
         debug!("Data to be sent= {}", data);
         if let Err(e) = sender.send(Message::Text(data.into())).await {
@@ -49,16 +52,17 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
     }
 
     // Spawn a task that will push notifications to the client (does not matter what client does)
+    let shutdown_token_send = shutdown_token.clone();
     let mut send_task = tokio::spawn(async move {
         // check for new notifications and sent them
         loop {
-            // Check shutdown flag before waiting for messages
-            if shutdown_flag_send.load(Ordering::SeqCst) {
-                debug!("Shutdown signal received in send task for {who}");
-                break;
-            }
-
             tokio::select! {
+                // Exit on shutdown token
+                _ = shutdown_token_send.cancelled() => {
+                    debug!("Shutdown signal received in send task for {who}");
+                    break;
+                }
+
                 result = rx.recv() => {
                     match result {
                         Ok(msg) => {
@@ -94,38 +98,34 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
         }
     });
     // Clone shutdown_flag for use in the select! loops
-    let shutdown_flag_recv = app.shutdown_flag.clone();
+    let shutdown_token_recv = shutdown_token.clone();
     // Spawn a task to handle incoming messages from the client and echo them back.
     let mut recv_task = tokio::spawn(async move {
         loop {
-            // Check shutdown flag before waiting for messages
-            if shutdown_flag_recv.load(Ordering::SeqCst) {
-                debug!("Shutdown signal received in recv task for {who}");
-                break;
-            }
-
-            if let Some(Ok(msg)) = receiver.next().await {
-                match msg {
-                    Message::Text(t) => {
-                        info!("Client sent: {}", t);
-                        if let Err(e) = app
-                            .broadcast_tx
-                            .lock()
-                            .await
-                            .send(format!("Echo: {}", t).into())
-                        {
-                            error!("Could not send message to broadcast channel: {}", e);
-                        }
-                    }
-                    Message::Close(_) => {
-                        debug!("Client closed connection");
-                        break;
-                    }
-                    _ => {}
+            tokio::select! {
+                // Exit on shutdown token
+                _ = shutdown_token_recv.cancelled() => {
+                    debug!("Shutdown signal received in send task for {who}");
+                    break;
                 }
-            } else {
-                // Stream ended (client disconnected)
-                break;
+                msg = receiver.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(t))) => {
+                            info!("Client sent: {}", t);
+                            if let Err(e) = app
+                                .broadcast_tx
+                                .send(format!("Echo: {}", t).into())
+                            {
+                                error!("Could not send message to broadcast channel: {}", e);
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            debug!("Client closed connection");
+                            break;
+                        }
+                        _ => {}
+                    }
+                    }
             }
         }
         debug!("Receive task finished for {who}");
