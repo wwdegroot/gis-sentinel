@@ -1,32 +1,36 @@
 pub mod config;
 pub mod handlers;
 pub mod schema;
+pub mod workers;
 
 use crate::config::Config;
 use crate::handlers::{
     generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
 };
+use crate::workers::alert_workers;
 use anyhow::Result;
 use axum::extract::ws::Message;
 use axum::routing::{get, Router};
-use schema::{AlertType, SentinelAlert};
+use schema::SentinelAlert;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::{
     broadcast::{self, Receiver, Sender},
-    Mutex,
+    watch, RwLock,
 };
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    pub broadcast_tx: Arc<Mutex<Sender<Message>>>,
-    pub broadcast_rx: Arc<Mutex<Receiver<Message>>>,
-    pub active_alerts: Arc<Mutex<Vec<SentinelAlert>>>,
-    pub shutdown_flag: Arc<AtomicBool>,
+    pub broadcast_tx: Sender<Message>,
+    pub broadcast_rx: Arc<Receiver<Message>>,
+    pub active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
+    pub shutdown_tx: watch::Sender<()>,
+    pub shutdown_rx: watch::Receiver<()>,
+    pub shutdown_token: CancellationToken,
 }
 
 #[tokio::main]
@@ -45,42 +49,23 @@ async fn main() -> Result<()> {
     // Create broadcast channel for WebSocket messages
     let (broadcast_tx, broadcast_rx) = broadcast::channel(32);
 
-    // Initialize active alerts with demo data
-    let active_alerts: Vec<SentinelAlert> = vec![
-        SentinelAlert {
-            id: "1".to_string(),
-            atype: AlertType::New,
-            name: "test1".to_string(),
-            performance: 300,
-            expected: 150,
-            up: true,
-            reason: "slow performance".to_string(),
-            error: None,
-        },
-        SentinelAlert {
-            id: "2".to_string(),
-            atype: AlertType::New,
-            name: "test2".to_string(),
-            performance: 150,
-            expected: 150,
-            up: false,
-            reason: "service down".to_string(),
-            error: None,
-        },
-    ];
-
-    // Create atomic boolean flag for graceful shutdown signaling
-    let shutdown_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-
+    // Create watch channel for graceful shutdown signaling
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // Cancellation token for graceful shutdown
+    let shutdown_token = CancellationToken::new();
     let app_state = AppState {
-        broadcast_tx: Arc::new(Mutex::new(broadcast_tx)),
-        broadcast_rx: Arc::new(Mutex::new(broadcast_rx)),
-        active_alerts: Arc::new(Mutex::new(active_alerts)),
-        shutdown_flag,
+        broadcast_tx: broadcast_tx,
+        broadcast_rx: Arc::new(broadcast_rx),
+        active_alerts: Arc::new(RwLock::new(vec![])),
+        shutdown_tx,
+        shutdown_rx,
+        shutdown_token: shutdown_token.clone(),
     };
 
-    // Clone shutdown_flag for use in the closure (before moving app_state)
-    let shutdown_notifier = app_state.shutdown_flag.clone();
+    // Clone shutdown_tx for use in the closure (before moving app_state)
+    let shutdown_notifier = app_state.shutdown_tx.clone();
+
+    tokio::spawn(alert_workers::start_alert_generator(app_state.clone()));
 
     // Build the application router
     let app = Router::new()
@@ -118,13 +103,17 @@ async fn main() -> Result<()> {
         let terminate = std::future::pending::<()>();
 
         tokio::select! {
-            _ = ctrl_c => {},
-            _ = terminate => {},
+            _ = ctrl_c => {
+                shutdown_token.cancel();
+            },
+            _ = terminate => {
+                shutdown_token.cancel();
+            },
         }
 
         tracing::info!("Shutdown signal received, notifying WebSocket handlers...");
-        // Set the atomic flag so all WebSocket handlers can detect it
-        shutdown_notifier.store(true, Ordering::SeqCst);
+        // Notify all connected WebSocket handlers to drain
+        let _ = shutdown_notifier.send(());
     };
 
     axum::serve(
