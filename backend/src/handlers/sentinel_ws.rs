@@ -7,7 +7,6 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use tokio::sync::broadcast::error::RecvError;
 //allows to extract the IP of connecting user
 use axum::extract::connect_info::ConnectInfo;
