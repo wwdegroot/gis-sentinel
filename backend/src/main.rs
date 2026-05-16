@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::{
     broadcast::{self, Receiver, Sender},
-    watch, RwLock,
+    RwLock,
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -28,8 +28,6 @@ pub struct AppState {
     pub broadcast_tx: Sender<Message>,
     pub broadcast_rx: Arc<Receiver<Message>>,
     pub active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
-    pub shutdown_tx: watch::Sender<()>,
-    pub shutdown_rx: watch::Receiver<()>,
     pub shutdown_token: CancellationToken,
 }
 
@@ -49,21 +47,14 @@ async fn main() -> Result<()> {
     // Create broadcast channel for WebSocket messages
     let (broadcast_tx, broadcast_rx) = broadcast::channel(32);
 
-    // Create watch channel for graceful shutdown signaling
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
     // Cancellation token for graceful shutdown
     let shutdown_token = CancellationToken::new();
     let app_state = AppState {
         broadcast_tx: broadcast_tx,
         broadcast_rx: Arc::new(broadcast_rx),
         active_alerts: Arc::new(RwLock::new(vec![])),
-        shutdown_tx,
-        shutdown_rx,
         shutdown_token: shutdown_token.clone(),
     };
-
-    // Clone shutdown_tx for use in the closure (before moving app_state)
-    let shutdown_notifier = app_state.shutdown_tx.clone();
 
     tokio::spawn(alert_workers::start_alert_generator(app_state.clone()));
 
@@ -112,8 +103,6 @@ async fn main() -> Result<()> {
         }
 
         tracing::info!("Shutdown signal received, notifying WebSocket handlers...");
-        // Notify all connected WebSocket handlers to drain
-        let _ = shutdown_notifier.send(());
     };
 
     axum::serve(
