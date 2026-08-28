@@ -7,7 +7,6 @@
 
     onMount(() => {
         socket.connect();
-        //socket.test()
     });
 
     onDestroy(() => {
