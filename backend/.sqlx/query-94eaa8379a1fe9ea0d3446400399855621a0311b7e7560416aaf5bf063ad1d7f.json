@@ -1,0 +1,90 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            id,\n            name,\n            url,\n            service_type AS \"service_type: ServiceType\",\n            check_interval_seconds,\n            expected_response_time_ms,\n            http_method AS \"http_method: _\",\n            custom_headers,\n            auth_config,\n            enabled,\n            created_at,\n            updated_at\n        FROM alert_points\n        WHERE (NOT $1::bool) OR enabled\n        ORDER BY created_at, id\n        LIMIT $2 OFFSET $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "service_type: ServiceType",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "check_interval_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "expected_response_time_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "http_method: _",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "custom_headers",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "auth_config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bool",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "94eaa8379a1fe9ea0d3446400399855621a0311b7e7560416aaf5bf063ad1d7f"
+}

@@ -1,5 +1,6 @@
 pub mod handlers;
 pub mod schema;
+use backend::db;
 use crate::handlers::{
     generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
 };
@@ -7,6 +8,7 @@ use crate::handlers::{
 use axum::extract::ws::Message;
 use axum::routing::{get, Router};
 use schema::{AlertType, SentinelAlert};
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{
@@ -19,12 +21,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Debug, Clone)]
 pub struct AppState {
     broadcast_tx: Arc<Mutex<Sender<Message>>>,
+    /// Kept for future fan-in usage; currently receivers subscribe directly.
+    #[allow(dead_code)]
     broadcast_rx: Arc<Mutex<Receiver<Message>>>,
     active_alerts: Arc<Mutex<Vec<SentinelAlert>>>,
+    /// PostgreSQL connection pool, shared across handlers/services.
+    /// (Currently unused by routes; consumed by services from Phase 2 onwards.)
+    #[allow(dead_code)]
+    db: PgPool,
 }
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -33,6 +42,17 @@ async fn main() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+    // database connection + migrations
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set (see .env.example)");
+    let db_pool = db::connect(&database_url)
+        .await
+        .unwrap_or_else(|e| panic!("could not connect to database: {e}"));
+    db::run_migrations(&db_pool)
+        .await
+        .unwrap_or_else(|e| panic!("database migrations failed: {e}"));
+    tracing::info!("database connected and migrations up to date");
+
     // share state
     let (tx, rx) = broadcast::channel(32);
     let active_alerts: Vec<SentinelAlert> = vec![
@@ -61,6 +81,7 @@ async fn main() {
         broadcast_tx: Arc::new(Mutex::new(tx)),
         broadcast_rx: Arc::new(Mutex::new(rx)),
         active_alerts: Arc::new(Mutex::new(active_alerts)),
+        db: db_pool,
     };
     // build our application with some routes and serve static files
     let app = Router::new()
@@ -86,3 +107,4 @@ async fn main() {
     .await
     .unwrap();
 }
+

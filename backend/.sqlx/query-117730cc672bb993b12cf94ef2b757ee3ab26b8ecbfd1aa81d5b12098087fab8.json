@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT 100.0 * AVG((is_up)::int)::float8 AS \"uptime_pct\"\n        FROM probe_results\n        WHERE alert_point_id = $1\n          AND timestamp > now() - make_interval(hours => $2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "uptime_pct",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "117730cc672bb993b12cf94ef2b757ee3ab26b8ecbfd1aa81d5b12098087fab8"
+}

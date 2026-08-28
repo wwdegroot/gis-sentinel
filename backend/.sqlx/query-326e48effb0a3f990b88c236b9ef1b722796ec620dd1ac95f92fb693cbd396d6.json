@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            id,\n            alert_point_id,\n            alert_type AS \"alert_type: AlertType\",\n            reason,\n            triggered_at,\n            resolved_at\n        FROM active_alerts\n        WHERE resolved_at IS NULL\n        ORDER BY triggered_at DESC, id DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "alert_point_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "alert_type: AlertType",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "triggered_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "resolved_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "326e48effb0a3f990b88c236b9ef1b722796ec620dd1ac95f92fb693cbd396d6"
+}

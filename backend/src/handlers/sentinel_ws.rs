@@ -31,7 +31,7 @@ pub async fn ws_sentinel_handler(
 }
 
 /// Actual websocket statemachine (one will be spawned per connection)
-async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): State<AppState>) {
+async fn handle_sentinel_socket(socket: WebSocket, _who: SocketAddr, State(app): State<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = app.broadcast_tx.lock().await.subscribe();
 
@@ -39,7 +39,7 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
     for alert in app.active_alerts.lock().await.iter() {
         let data = serde_json::to_string(alert).expect("Valid SentinelAlert data");
         debug!("Data to be sent= {}", data);
-        if let Err(e) = sender.send(Message::Text(data)).await {
+        if let Err(e) = sender.send(Message::Text(data.into())).await {
             error!("Error sending message: {}", e);
         }
     }
