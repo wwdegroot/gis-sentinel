@@ -21,5 +21,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+# Valkey/Redis queue client + pooled connections (task 1.2)
+redis = { version = "0.27", features = ["tokio-comp"] }
+deadpool-redis = "0.18"
+# typed environment configuration (task 1.3)
+envy = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

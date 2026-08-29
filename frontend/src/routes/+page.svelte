@@ -5,13 +5,13 @@
 
     let messages: string[] = $state([]);
 
-    let timeoutID: number = 0;
+    let timeoutID: ReturnType<typeof setTimeout> | undefined;
     let start: boolean = $state(false);
     let textMessage: string = $state('');
 
     function startMessaging() {
         start = true;
-        socket = new WebSocket(`ws://${location.hostname}:3000/ws`);
+        socket = new WebSocket(`ws://${location.host}/ws`);
         socket.addEventListener('open', function (event) {
             socket.send('Hello Server!');
         });

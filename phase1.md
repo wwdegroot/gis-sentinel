@@ -1,8 +1,12 @@
-# Phase 1.1 — PostgreSQL Database Integration (Plan)
+# Phase 1 — Infrastructure & Data Architecture (Plans & Implementation Reports)
 
-Scope: `tasks.md` → Phase 1 → **1.1 PostgreSQL Database Integration**
+Covers `tasks.md` → Phase 1: **1.1 PostgreSQL Database Integration** · **1.2 Valkey/Redis Queue** · **1.3 Environment & Configuration** · **1.4 Local Development Environment**
 
-Status: ✅ **IMPLEMENTED & VERIFIED** — all decisions confirmed; see section 8 for the implementation report.
+Status: ✅ **ALL FOUR TASKS IMPLEMENTED & VERIFIED** — 1.1 report in section 8, 1.2–1.4 in Parts 2–4 below.
+
+---
+
+## Part 1 — Task 1.1 PostgreSQL Database Integration
 
 ---
 
@@ -141,3 +145,80 @@ backend/src/
 - `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt -- --check` clean.
 - Portable PostgreSQL 16.15 (no docker/root) started locally; app startup applied migration 0001 to empty DB; server boots and serves `HTTP 200` on `/`.
 - `cargo test -- --ignored` passes: full repository round trip (create → read → update → probe insert/truncation → uptime aggregation → alert trigger/unique-violation/resolve → cascade delete).
+
+---
+
+## Part 2 — Task 1.2 Valkey / Redis Queue Integration
+
+### Plan (decisions)
+
+| # | Question | Options | Decision |
+|---|----------|---------|----------|
+| Q9 | Client & pooling | a) `redis` crate with a single multiplexed `ConnectionManager`, b) `redis` + `deadpool-redis` pool | **b) `redis` 0.27 + `deadpool-redis` 0.18**, pool max 10 — real pool, broken connections are recreated transparently. Valkey is Redis-wire-compatible, so no Valkey-specific crate is needed. |
+| Q10 | Queue semantics | a) LIST (`LPUSH`/`BRPOP`, FIFO), b) Streams, c) Pub/Sub only | **a) LIST `sentinel:probe_jobs`** — one job, one worker; blocking pop gives natural back-pressure. A Pub/Sub channel `sentinel:alerts` is reserved for lifecycle fan-out in tasks 2.3/2.4 (not used yet). |
+| Q11 | Startup behaviour when Valkey is unreachable | a) abort (like the DB), b) warn + continue | **b) warn + continue** — nothing consumes the queue until Phase 2; the docker-compose `valkey-gs` makes it available locally. Revisit when the scheduler lands. |
+
+### Implementation report
+
+**Files added**
+- `backend/src/queue/mod.rs` — `ProbeJob` serde payload (`target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms` — the wire contract for tasks 2.2/2.3); `RedisPool` alias; `connect()` (pool max 10); `health_check()` (`PING` → `PONG`); `enqueue_probe_job()` (`LPUSH`), `dequeue_probe_job()` (`BRPOP`, tuple-aware, blocking with timeout), `queue_len()`, `clear_queue()`; `QueueError` wrapping pool/serde errors.
+- `backend/tests/queue_smoke.rs` — `#[ignore]`-gated round trip: health check → clear → enqueue → len → dequeue → serde equality → blocking timeout returns `None`.
+
+**Files modified**
+- `backend/Cargo.toml` — added `redis = 0.27` (`tokio-comp`), `deadpool-redis = 0.18`.
+- `backend/src/lib.rs` — `pub mod queue`.
+- `backend/src/main.rs` — `RedisPool` added to `AppState` (unused by routes yet, like the `PgPool`); startup creates the pool and runs the health check (warn + continue per Q11).
+
+**Verification performed**
+- Portable Valkey 8.1.3 built from source (no docker/root — same approach as 1.1's PostgreSQL) and run locally.
+- `cargo test -- --ignored queue_smoke` passes against the live Valkey (this caught that `BRPOP` replies with a `(key, payload)` tuple).
+
+---
+
+## Part 3 — Task 1.3 Environment & Configuration Management
+
+### Plan (decisions)
+
+| # | Question | Options | Decision |
+|---|----------|---------|----------|
+| Q12 | Config mechanism | a) `config` crate, b) `envy` typed deserialization, c) hand-rolled `std::env::var` | **b) `envy` 0.4** — serde-derive struct with defaults, env vars map case-insensitively to fields; `dotenvy` still loads `.env` first. Missing `DATABASE_URL` fails fast with a clear error. |
+| Q13 | Default bind address | a) `127.0.0.1:3000`, b) `0.0.0.0:3000` | **b) `0.0.0.0:3000`** — container-friendly; matches dev proxy and docker-compose. |
+| Q14 | Frontend host/port removal | a) keep `:3000` via env-injected constant, b) same-origin URLs + dev proxy | **b)** production already serves the Svelte build from the backend (rust-embed), so `ws://${location.host}/...` is correct there; `vite dev` gets a proxy for `/ws` (ws-aware) and `/api` to `http://127.0.0.1:${BACKEND_PORT ?? 3000}`. (Phase 3.1 will further refine URL construction incl. `wss`.) |
+
+### Implementation report
+
+**Files added**
+- `backend/src/config.rs` — `Config { database_url, redis_url, server_host, server_port, log_level }` via `envy`, serde defaults for everything except `DATABASE_URL`.
+
+**Files modified**
+- `backend/Cargo.toml` — added `envy = 0.4`.
+- `backend/src/lib.rs` — `pub mod config`.
+- `backend/src/main.rs` — config built before tracing init; `RUST_LOG` fallback now uses `LOG_LEVEL`; listener binds `(SERVER_HOST, SERVER_PORT)` instead of hardcoded `127.0.0.1:3000`; DB URL comes from config.
+- `backend/.env.example` — full list: `DATABASE_URL`, `REDIS_URL`, `SERVER_HOST`, `SERVER_PORT`, `LOG_LEVEL` (+ build-time `SQLX_OFFLINE`).
+- `frontend/src/routes/+page.svelte`, `frontend/src/routes/sentinel/+page.svelte` — WebSocket URLs use `${location.host}` instead of `${location.hostname}:3000`.
+- `frontend/vite.config.ts` — dev proxy for `/ws` (with `ws: true`) and `/api`; `@types/node` reference for typing.
+- `frontend/package.json` — added `@types/node` dev dependency (needed by the config); `+page.svelte` `timeoutID` typed as `ReturnType<typeof setTimeout>` (check error surfaced by node types).
+
+**Verification performed**
+- Boot with `SERVER_PORT=3001` → `HTTP 200` (override respected); boot with defaults → `HTTP 200` on port 3000.
+- `svelte-check`: 0 errors; backend `cargo clippy --all-targets -- -D warnings` / `cargo fmt -- --check` clean.
+
+---
+
+## Part 4 — Task 1.4 Local Development Environment
+
+### Plan
+
+Extend `docker/docker-compose.yml` (external `dev-net` network and `postgres-gs` kept as-is) with:
+- `valkey-gs` — `valkey/valkey:8.1.3-alpine`, port 6379, AOF persistence on named volume, `valkey-cli ping` healthcheck.
+- `pgadmin` — `dpage/pgadmin4:9` on port 5050 (`dev@gis-sentinel.local` / `postgres`) for Postgres inspection.
+- `redis-commander` — `rediscommander/redis-commander` on port 8081, wired to `valkey-gs`, starts only after it is healthy.
+
+### Implementation report
+
+**Files modified**
+- `docker/docker-compose.yml` — the three services above plus a `valkey-data` volume; `postgres-gs`, `dev-net` unchanged.
+
+**Verification performed**
+- Docker is unavailable in this environment (see 1.1 Q5); Valkey behaviour was verified live with portable 8.1.3 binaries in Part 2, matching the compose image (`valkey/valkey:8.1.3`).
+- `backend/.env` / `.env.example` defaults (`redis://127.0.0.1:6379`) align with the compose port mapping; within `dev-net` use `redis://valkey-gs:6379`.

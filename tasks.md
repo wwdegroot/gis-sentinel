@@ -30,21 +30,20 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
     - **`alert_logs` / `probe_results`**: id, alert_point_id, timestamp, response_time_ms, status_code, is_up, error_message, raw_response_snippet.
     - **`active_alerts`**: id, alert_point_id, alert_type (`New`, `Update`, `Remove`), reason, triggered_at, resolved_at.
 
-- [ ] **1.2 Valkey / Redis Queue Integration**
-  - [ ] Add Valkey client dependency.
-  - [ ] Define queue data structures (job payload schema with Serde: `target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms`).
-  - [ ] Implement Redis connection pooling and health checks.
+- [x] **1.2 Valkey / Redis Queue Integration**
+  - [x] Add Valkey client dependency. (`redis` 0.27 + `deadpool-redis` 0.18 pooled client — Valkey is Redis-compatible; see `phase1.md`)
+  - [x] Define queue data structures (job payload schema with Serde: `target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms`). (`src/queue/mod.rs` → `ProbeJob`, list key `sentinel:probe_jobs`)
+  - [x] Implement Redis connection pooling and health checks. (`queue::connect()` pool max 10, `queue::health_check()` PING; pool in `AppState`)
 
-- [ ] **1.3 Environment & Configuration Management**
-  - [ ] Create structured configuration module using `config` or `dotenvy` / `envy`.
-  - [ ] Define `.env.example` with: `DATABASE_URL`, `REDIS_URL`, `SERVER_HOST`, `SERVER_PORT`, `LOG_LEVEL`.
-  - [ ] Remove hardcoded host/port (`127.0.0.1:3000`) in backend and frontend.
+- [x] **1.3 Environment & Configuration Management**
+  - [x] Create structured configuration module using `config` or `dotenvy` / `envy`. (`src/config.rs`, typed `Config` via `envy`, fail-fast on missing `DATABASE_URL`)
+  - [x] Define `.env.example` with: `DATABASE_URL`, `REDIS_URL`, `SERVER_HOST`, `SERVER_PORT`, `LOG_LEVEL`.
+  - [x] Remove hardcoded host/port (`127.0.0.1:3000`) in backend and frontend. (backend binds via `SERVER_HOST`/`SERVER_PORT`; frontend uses same-origin `location.host` + `vite.config.ts` dev proxy to backend)
 
-- [ ] **1.4 Local Development Environment**
-  - [ ] Add `docker-compose.yml` defining:
-    - PostgreSQL container (optionally PostGIS enabled)
-    - Valkey / Redis container
-    - Optional pgAdmin / Redis commander for dev inspection.
+- [x] **1.4 Local Development Environment**
+  - [x] Update `docker/docker-compose.yml` defining:
+    - Valkey / Redis container (`valkey-gs`, valkey 8.1.3-alpine, AOF persistence + healthcheck)
+    - pgAdmin (port 5050) / Redis Commander (port 8081) for dev inspection.
 
 ---
 
