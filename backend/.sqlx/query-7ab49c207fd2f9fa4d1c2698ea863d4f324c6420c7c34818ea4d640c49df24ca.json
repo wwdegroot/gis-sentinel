@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(*)::bigint AS \"count!\"\n        FROM alert_points\n        WHERE ((NOT $1::bool) OR enabled)\n          AND ($2::text IS NULL OR service_type = $2::text)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7ab49c207fd2f9fa4d1c2698ea863d4f324c6420c7c34818ea4d640c49df24ca"
+}
