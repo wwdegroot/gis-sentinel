@@ -49,15 +49,16 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 
 ## ⚙️ Phase 2: Backend Services Implementation
 
-- [ ] **2.1 API Service (Alert Points CRUD)**
-  - [ ] Create REST routes under `/api/v1/alert-points`:
-    - `GET /api/v1/alert-points` - List all configured monitoring points (with filtering & pagination).
-    - `POST /api/v1/alert-points` - Create a new monitoring point.
-    - `GET /api/v1/alert-points/:id` - Fetch single monitoring point details and recent probe history.
-    - `PUT /api/v1/alert-points/:id` - Update monitoring point settings.
-    - `DELETE /api/v1/alert-points/:id` - Delete a monitoring point.
-    - `POST /api/v1/alert-points/:id/test` - Trigger an on-demand probe check.
-  - [ ] Implement request payload validation (valid URLs, positive intervals/thresholds, recognized GIS service types).
+- [x] **2.1 API Service (Alert Points CRUD)** ✅ implemented (see `phase2.md` §2)
+  - [x] Create REST routes under `/api/v1/alert-points` (GET/POST only; state changes as POST sub-actions):
+    - [x] `GET /api/v1/alert-points` - List all configured monitoring points (with filtering & pagination).
+    - [x] `POST /api/v1/alert-points` - Create a new monitoring point.
+    - [x] `GET /api/v1/alert-points/:id` - Fetch single monitoring point details and recent probe history.
+    - [x] `POST /api/v1/alert-points/:id/update` - Update monitoring point settings (partial).
+    - [x] `POST /api/v1/alert-points/:id/delete` - Delete a monitoring point.
+    - [x] `POST /api/v1/alert-points/:id/test` - Trigger an on-demand probe check. (HTTP-level transport probe; GIS-specific checks land with 2.3)
+  - [x] Implement request payload validation (valid URLs, positive intervals/thresholds, recognized GIS service types).
+  - Note: axum 0.8 nested routes match `/api/v1/alert-points` but **not** `/api/v1/alert-points/` (trailing slash falls through to the SPA fallback).
 
 - [ ] **2.2 Scheduler Service (Queue Producer)**
   - [ ] Implement background scheduler loop (using `tokio::time::interval` or `tokio-cron-scheduler`).
