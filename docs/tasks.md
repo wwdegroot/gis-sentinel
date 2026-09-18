@@ -1,156 +1,178 @@
-Backend Code Review: GIS Sentinel
+# GIS Sentinel - Tasks & Roadmap
 
-## Overview
-
-The backend is an Axum-based Rust application serving two WebSocket endpoints (`/ws` and `/ws/sentinel`) and embedding a SvelteKit frontend as static assets. It's clearly a proof of concept — functional but missing many production-ready foundations.
+This document outlines the roadmap and missing components for **GIS Sentinel**, based on the architecture described in [README.md](./README.md) and the current state of `backend/` and `frontend/`.
 
 ---
 
-## Critical Issues (Must Fix)
+## 📊 Current State vs Target Architecture Gap Analysis
 
-### 1. Remove Dead / Demo Code
-- **File:** `src/handlers/websockets.rs` — This entire file is copied from the Axum example. The `/ws` endpoint sends hardcoded "Hi X times!" and "Server message X..." messages. It doesn't use `AppState` at all (unused parameters trigger warnings). Decide: either integrate it meaningfully or delete it entirely.
-
-### 2. FIXED: Hardcoded Bind Address & Crashing `.unwrap()` Calls
-- **File:** `src/main.rs:L63-L64` — `tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap()` will crash if the port is in use or binding fails. Same for the tracing subscriber init on L35.
-- **Fix:** Use environment variables or a config file for the bind address/port, and propagate errors instead of unwrapping. 
-
-### 3. FIXED: No Configuration Management
-- Port, host, CORS origins, alert thresholds — everything is hardcoded.
-- **Fix:** Introduce a `Config` struct loaded from `.env` (using `dotenvy`) or a TOML/JSON config file with sensible defaults.
-
-### 4. Fragile Frontend Path Embedding
-- **File:** `src/handlers/generic.rs:L12` — `#[folder = r"..\frontend\build\"]` uses a Windows-specific relative path. This will break on Linux/macians and in CI.
-- **Fix:** Use an environment variable or build script to resolve the frontend output directory, e.g.:
-  ```rust
-  const FRONTEND_BUILD: &str = env!("FRONTEND_BUILD_DIR");
-  #[folder = "$FRONTEND_BUILD_DIR"]
-  struct Assets;
-  ```
-
-### 5. FIXED: No Graceful Shutdown
-- **File:** `src/main.rs` — When the process receives SIGINT/SIGTERM, connections are dropped abruptly.
-- **Fix:** Use `tokio::signal` to catch shutdown signals and call `server.with_graceful_shutdown(...)` to drain active WebSocket connections.
+| Component | Target Architecture (`README.md`) | Current Status |
+|---|---|---|
+| **Database** | PostgreSQL for storing monitoring targets, configs, and history | ❌ Missing (No DB connection, schema, or migrations) |
+| **Queue / Broker** | Valkey / Redis for alert jobs and worker coordination | ❌ Missing (No Redis/Valkey integration) |
+| **Backend API Service** | REST API for CRUD operations on Alert Points | ❌ Missing (Only mock in-memory alerts exist) |
+| **Backend Scheduler** | Periodically enqueues check jobs into Valkey/Redis | ❌ Missing |
+| **Backend Worker** | Consumes queue, probes GIS endpoints (WMS/WFS/REST), evaluates thresholds | ❌ Missing |
+| **Backend Web Server** | Axum server with WebSockets and embedded frontend | ⚠️ Partial (Basic WebSocket echo & mock alert streaming; Windows-specific embed path) |
+| **Frontend Dashboard** | Real-time monitoring dashboard with live status cards and metrics | ⚠️ Partial (Minimal raw key-value display prototype) |
+| **Frontend CRUD UI** | Management interface to configure GIS endpoints, thresholds, intervals | ❌ Missing |
+| **DevOps / Infra** | Docker compose, CI/CD, production builds | ❌ Missing |
 
 ---
 
-## High Priority (Should Fix)
+## 🚀 Phase 1: Infrastructure & Data Architecture
 
-### 6. No Authentication / Authorization
-- Both WebSocket endpoints are publicly accessible — anyone can connect, send messages, and receive alerts.
-- **Fix:** Add at minimum an API key or JWT-based auth middleware for the sentinel endpoint. Consider per-client permissions if multiple teams will use this.
+- [ ] **1.1 PostgreSQL Database Integration**
+  - [x] Choose and configure an async query engine `sqlx` with Postgres driver. (sqlx 0.8, compile-time checked `query!` macros + committed `.sqlx` offline cache; see `phase1.md`)
+  - [x] Implement database migrations (`sqlx-cli` or embedded migrations). (embedded `sqlx::migrate!()`, applied at startup; `sqlx-cli` 0.8.6 for `prepare`)
+  - [x] Design schema for:
+    - **`alert_points`**: id, name, url, service_type (`WMS`, `WFS`, `WMTS`, `OAF`, `ArcGIS_REST`, `HTTP`), check_interval_seconds, expected_response_time_ms, http_method, custom_headers, auth_config, enabled, created_at, updated_at. (`migrations/0001_initial_schema.sql`)
+    - **`alert_logs` / `probe_results`**: id, alert_point_id, timestamp, response_time_ms, status_code, is_up, error_message, raw_response_snippet.
+    - **`active_alerts`**: id, alert_point_id, alert_type (`New`, `Update`, `Remove`), reason, triggered_at, resolved_at.
 
-### 7. Broadcast Channel Drops Messages
-- **File:** `src/main.rs:L32` — `broadcast::channel(32)` only holds 32 messages. When it fills up, older messages are silently dropped (L59 in `sentinel_ws.rs` just logs and continues).
-- **Fix:** Either increase capacity significantly, implement a queue with backpressure, or use a per-client message buffer so late-connecting clients don't miss state updates.
+- [x] **1.2 Valkey / Redis Queue Integration**
+  - [x] Add Valkey client dependency. (`redis` 0.27 + `deadpool-redis` 0.18 pooled client — Valkey is Redis-compatible; see `phase1.md`)
+  - [x] Define queue data structures (job payload schema with Serde: `target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms`). (`src/queue/mod.rs` → `ProbeJob`, list key `sentinel:probe_jobs`)
+  - [x] Implement Redis connection pooling and health checks. (`queue::connect()` pool max 10, `queue::health_check()` PING; pool in `AppState`)
 
-### 8. No Alert Persistence Layer
-- **File:** `src/main.rs:L37-L56` — Alerts are hardcoded as static data in `main()`. There's no database, no way to add/remove alerts at runtime (beyond echoing messages).
-- **Fix:** Introduce a persistence layer:
-  - Start with an in-memory store wrapped behind a trait (for testability)
-  - Progress to SQLite (`sqlx` or `rusqlite`) for durability
-  - Add CRUD endpoints for managing alerts
+- [x] **1.3 Environment & Configuration Management**
+  - [x] Create structured configuration module using `config` or `dotenvy` / `envy`. (`src/config.rs`, typed `Config` via `envy`, fail-fast on missing `DATABASE_URL`)
+  - [x] Define `.env.example` with: `DATABASE_URL`, `REDIS_URL`, `SERVER_HOST`, `SERVER_PORT`, `LOG_LEVEL`.
+  - [x] Remove hardcoded host/port (`127.0.0.1:3000`) in backend and frontend. (backend binds via `SERVER_HOST`/`SERVER_PORT`; frontend uses same-origin `location.host` + `vite.config.ts` dev proxy to backend)
 
-### 9. No Health Check Endpoint
-- **Fix:** Add a `/health` endpoint returning `200 OK` with optional status details. Essential for Docker health checks, load balancers, and monitoring.
-
-### 10. No CORS Configuration
-- If the frontend is ever served from a different origin (or during development), requests will be blocked.
-- **Fix:** Add `tower-http::cors::CorsLayer` with configurable allowed origins.
-
----
-
-## Medium Priority (Should Improve)
-
-### 11. No API Versioning
-- WebSocket protocols are fragile to change. Without versioning, breaking changes will break all clients.
-- **Fix:** Prefix routes with a version (`/api/v1/ws/sentinel`) or include a protocol version in the handshake.
-
-### 12. Weak Data Model Validation
-- **File:** `src/schema.rs` — `SentinelAlert` fields have no constraints (e.g., `performance` and `expected` are raw `i32`, `id` is an unvalidated `String`).
-- **Fix:** Add validation using `validator` crate or custom `TryFrom` implementations. Consider using non-negative types for performance/expected values.
-
-### 13. No Rate Limiting
-- WebSocket endpoints have no rate limiting — a single client could flood the broadcast channel.
-- **Fix:** Add a rate-limiting middleware (e.g., `tower-rate-limit` or a custom layer).
-
-### 14. Inconsistent Error Handling Patterns
-- Some errors are logged and broken from (`sentinel_ws.rs`), others are silently ignored (`websockets.rs`). No unified error response type.
-- **Fix:** Define an `AppError` enum with variants for different failure modes, and use a custom `ErrorHandler` layer in Axum.
-
-### 15. Missing Unit / Integration Tests
-- Zero tests exist. The broadcast logic, alert management, and WebSocket handling are all untested.
-- **Fix:** Add:
-  - Unit tests for schema validation
-  - Integration tests using `axum::Router::new().into_service()` to test endpoints
-  - Mock-based tests for the alert service layer
+- [x] **1.4 Local Development Environment**
+  - [x] Update `docker/docker-compose.yml` defining:
+    - Valkey / Redis container (`valkey-gs`, valkey 8.1.3-alpine, AOF persistence + healthcheck)
+    - pgAdmin (port 5050) / Redis Commander (port 8081) for dev inspection.
 
 ---
 
-## Low Priority (Nice to Have)
+## ⚙️ Phase 2: Backend Services Implementation
 
-### 16. No Metrics / Observability
-- Basic tracing is set up, but there are no application metrics.
-- **Fix:** Add `axum-prometheus` or OpenTelemetry for:
-  - Active WebSocket connections count
-  - Messages sent/received rate
-  - Alert creation/removal counters
-  - Response time histograms
+- [ ] **2.1 API Service (Alert Points CRUD)**
+  - [ ] Create REST routes under `/api/v1/alert-points`:
+    - `GET /api/v1/alert-points` - List all configured monitoring points (with filtering & pagination).
+    - `POST /api/v1/alert-points` - Create a new monitoring point.
+    - `GET /api/v1/alert-points/:id` - Fetch single monitoring point details and recent probe history.
+    - `PUT /api/v1/alert-points/:id` - Update monitoring point settings.
+    - `DELETE /api/v1/alert-points/:id` - Delete a monitoring point.
+    - `POST /api/v1/alert-points/:id/test` - Trigger an on-demand probe check.
+  - [ ] Implement request payload validation (valid URLs, positive intervals/thresholds, recognized GIS service types).
 
-### 17. No Dockerfile / Containerization
-- **Fix:** Create a multi-stage Dockerfile to minimize the final image size (compile in stage 1, run with musl in stage 2).
+- [ ] **2.2 Scheduler Service (Queue Producer)**
+  - [ ] Implement background scheduler loop (using `tokio::time::interval` or `tokio-cron-scheduler`).
+  - [ ] Periodically query enabled `alert_points` from database based on their `check_interval_seconds`.
+  - [ ] Push probe jobs into the Valkey/Redis queue avoiding duplicate in-flight checks.
 
-### 18. No CI/CD Pipeline
-- **Fix:** Add GitHub Actions for:
-  - `cargo check`, `cargo clippy`, `cargo test` on every PR
-  - Build and deploy on main branch merge
+- [ ] **2.3 Worker Service (GIS Probe Executor & Evaluator)**
+  - [ ] Implement worker loop pulling jobs from the Redis queue.
+  - [ ] Build GIS probe client using `reqwest`:
+    - Support HTTP GET/POST with customizable headers/timeout.
+    - GIS-specific checks (e.g. `GetCapabilities` XML parsing for WMS/WFS, health ping for ArcGIS Server).
+    - Measure high-resolution latency (TTFB and total transfer duration).
+  - [ ] Implement alert state evaluation logic:
+    - Check if service is unreachable or returns HTTP 4xx/5xx errors.
+    - Compare actual latency against `expected_response_time_ms`.
+    - Detect state transitions (`Up` -> `Down`/`Degraded`, `Down` -> `Recovered`).
+  - [ ] Persist probe metrics to PostgreSQL.
+  - [ ] Push state transition alerts to Redis Pub/Sub or backend broadcast channel.
 
-### 19. Improve AlertType Semantics
-- **File:** `src/schema.rs:L4` — The `AlertType` enum has `Update`, `New`, `Remove`. Consider renaming to more descriptive variants or adding documentation explaining when each is emitted.
+- [ ] **2.4 WebSocket & Real-time Alert Hub**
+  - [ ] Connect WebSocket broadcaster to real-time worker events (via Redis PubSub or Tokio broadcast).
+  - [ ] Implement initial state synchronization when frontend clients connect (send full active alert list).
+  - [ ] Handle incremental alert lifecycle events:
+    - `New`: Newly triggered outage or degradation.
+    - `Update`: Status changed (e.g., latency worsened or partial recovery).
+    - `Remove`: Service resolved / back to healthy state.
+  - [ ] Clean up legacy demo code in `handlers/websockets.rs` and consolidate into `handlers/sentinel_ws.rs`.
 
-### 20. Separate Frontend Embedding from Backend Logic
-- The hardcoded relative path and tight coupling between frontend build output and backend make the build process fragile.
-- **Fix:** Use a build script (`build.rs`) to verify the frontend exists at build time, or support an external static directory as a fallback when `rust-embed` assets aren't found.
-
----
-
-## Suggested Architecture for v2
-
-```
-backend/
-├── src/
-│   ├── main.rs            # Entry point, config loading, server setup
-│   ├── config.rs          # Configuration struct + loader
-│   ├── error.rs           # Unified AppError type + handler
-│   ├── state.rs           # AppState with typed service accessors
-│   ├── schema/
-│   │   ├── mod.rs
-│   │   └── alert.rs       # SentinelAlert, AlertType, validation
-│   ├── handlers/
-│   │   ├── mod.rs
-│   │   ├── sentinel_ws.rs  # Sentinel WebSocket handler only
-│   │   └── health.rs       # Health check endpoint
-│   ├── services/
-│   │   ├── mod.rs
-│   │   ├── alert_service.rs  # Trait + in-memory impl (later DB impl)
-│   │   └── broadcast.rs      # Connection manager for WebSocket clients
-│   └── middleware/
-│       ├── mod.rs
-│       └── auth.rs           # Auth middleware
-├── tests/
-│   └── integration_tests.rs
-├── build.rs                # Verify frontend output exists
-└── Cargo.toml
-```
+- [ ] **2.5 Backend Technical Debt & Fixes**
+  - [x] Fix cross-platform static asset embed path in `backend/src/handlers/generic.rs` (change `r"..\frontend\build\"` to `"../frontend/build"`). (done early as part of 1.1 — blocked all Linux builds)
+  - [ ] Add graceful shutdown handling for Tokio tasks, DB pools, and server listeners.
+  - [ ] Improve error handling and structured logging with request tracing IDs.
 
 ---
 
-## Recommended Priority Order for Execution
+## 🎨 Phase 3: Frontend Development & UI/UX
 
-| Phase | Tasks | Effort |
-|-------|-------|--------|
-| **Phase 1 — Stabilize** | #1, #2, #3, #4, #5 | Medium |
-| **Phase 2 — Secure** | #6, #9, #10, #13 | Medium |
-| **Phase 3 — Persist** | #8, #7, #11 | High |
-| **Phase 4 — Harden** | #12, #14, #15 | Medium |
-| **Phase 5 — Operate** | #16, #17, #18 | Low-Medium
+- [ ] **3.1 WebSocket Client Improvements (`sentinelSocket.svelte.ts`)**
+  - [ ] Fix typo: rename `adress` to `address`.
+  - [ ] Implement `Update` and `Remove` handling in `processMessage` (update existing alert by id, remove resolved alert).
+  - [ ] Add auto-reconnect with exponential backoff and connection state indicators (Connected, Reconnecting, Disconnected).
+  - [ ] Implement dynamic WebSocket URL resolution using `window.location.host` and `ws:`/`wss:` protocols.
+
+- [ ] **3.2 Application Layout & Navigation**
+  - [ ] Replace temporary demo root `routes/+page.svelte` with a proper landing dashboard.
+  - [ ] Add a global navigation bar in `routes/+layout.svelte`:
+    - **Dashboard** (`/sentinel` or `/`) - Real-time alerts and service status overview.
+    - **Services / Alert Points** (`/services`) - List and manage GIS endpoints.
+    - **History / Logs** (`/history`) - Historical probe records and uptime metrics.
+    - **Settings** (`/settings`) - Global thresholds and notification settings.
+  - [ ] Add dark/light mode and Tailwind theme styling.
+
+- [ ] **3.3 Live Sentinel Monitoring Dashboard (`/sentinel`)**
+  - [ ] Redesign alert cards with GIS service metadata:
+    - Service name, endpoint URL, service type badge (WMS, WFS, REST).
+    - Status badge: `Healthy`, `Degraded (Slow)`, `Down (Unreachable)`.
+    - Latency bar / meter (current vs expected SLA).
+    - Failure reason / HTTP status / error snippet.
+    - Duration of current outage / alert timestamp.
+  - [ ] Summary statistics header (Total monitored, Total Healthy, Active Incidents, Average Latency).
+  - [ ] Filters by service type, status, and search query.
+
+- [ ] **3.4 Alert Points Configuration Interface (`/services`)**
+  - [ ] Data table showing all monitored GIS services with quick toggles (enable/disable).
+  - [ ] Modal/Form for adding and editing alert points:
+    - Target URL, Name, GIS Service Type.
+    - Expected SLA Latency (ms), Check Interval (seconds), Timeout (seconds).
+    - Custom headers, HTTP Basic Auth / API token.
+  - [ ] "Test Now" button with immediate probe result feedback.
+  - [ ] Delete confirmation modal.
+
+- [ ] **3.5 Historical Analytics & Service Detail View**
+  - [ ] Time-series latency charts for monitored endpoints.
+  - [ ] Uptime percentage over 24h / 7d / 30d periods.
+  - [ ] Incident log history table with export to CSV/JSON.
+
+---
+
+## 📦 Phase 4: DevOps, Build & Deployment
+
+- [ ] **4.1 Production Multi-Stage Dockerfile**
+  - [ ] Stage 1: Build frontend with Node.js & pnpm (`pnpm build`).
+  - [ ] Stage 2: Build Rust backend with `cargo build --release` (embedding frontend static build).
+  - [ ] Stage 3: Minimal runtime image (`debian-slim` or `alpine`) containing the single unified binary.
+
+- [ ] **4.2 Continuous Integration & Testing (CI/CD)**
+  - [ ] GitHub Actions workflow for:
+    - Backend: `cargo check`, `cargo test`, `cargo clippy`, `cargo fmt --check`.
+    - Frontend: `pnpm svelte-check`, `pnpm lint`, `pnpm test`, `pnpm build`.
+
+- [ ] **4.3 Production Deployment & Health Checks**
+  - [ ] Add `/healthz` and `/livez` HTTP endpoints for container orchestration / Kubernetes readiness probes.
+  - [ ] Add documentation for production deployment and environment configuration.
+
+---
+
+## 🧪 Phase 5: Testing & Quality Assurance
+
+- [ ] **5.1 Backend Tests**
+  - [ ] Unit tests for GIS probe parsing and SLA calculation.
+  - [ ] Unit tests for alert state transitions (`New`, `Update`, `Remove`).
+  - [ ] Integration tests for REST CRUD API endpoints using Axum test utilities.
+  - [ ] Mock tests for Redis queue producer/consumer flows.
+
+- [ ] **5.2 Frontend Tests**
+  - [ ] Unit tests for `SentinelSocket` state machine (connection, reconnection, message routing).
+  - [ ] Component tests for Alert Card, Status Badges, and Form validation.
+  - [ ] End-to-end tests (Playwright) covering service creation and real-time alert rendering.
+
+---
+
+## 📌 Suggested Immediate Next Steps
+
+1. ✅ **Fix cross-platform embed path** in `backend/src/handlers/generic.rs` to allow compiling on Linux/macOS. (done as part of 1.1)
+2. **Add `docker-compose.yml`** with Postgres and Valkey/Redis for local service dependencies.
+3. ✅ **Implement Database & Schema** for `alert_points` and connect backend via `sqlx`. (done as part of 1.1, incl. repository layer + offline query cache)
+4. **Implement REST CRUD Endpoints** in backend and build the `/services` frontend management page.
+5. **Implement Scheduler & Worker** loop to turn GIS Sentinel from mock data into a functioning monitoring engine.

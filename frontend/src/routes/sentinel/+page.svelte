@@ -3,11 +3,10 @@
     import type { SentinelAlert } from '$lib/types';
     import { onDestroy, onMount } from 'svelte';
 
-    let socket: SentinelSocket = new SentinelSocket(`ws://${location.hostname}:3000/ws/sentinel`);
+    let socket: SentinelSocket = new SentinelSocket(`ws://${location.host}/ws/sentinel`);
 
     onMount(() => {
         socket.connect();
-        //socket.test()
     });
 
     onDestroy(() => {

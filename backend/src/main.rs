@@ -7,6 +7,14 @@ use crate::config::Config;
 use crate::handlers::{
     generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
 };
+use backend::config::Config;
+use backend::db;
+use backend::queue;
+
+use axum::extract::ws::Message;
+use axum::routing::{get, Router};
+use schema::{AlertType, SentinelAlert};
+use sqlx::PgPool;
 use crate::workers::alert_workers;
 use anyhow::Result;
 use axum::extract::ws::Message;
@@ -25,23 +33,90 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    pub broadcast_tx: Sender<Message>,
-    pub broadcast_rx: Arc<Receiver<Message>>,
-    pub active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
-    pub shutdown_token: CancellationToken,
+    broadcast_tx: Arc<Mutex<Sender<Message>>>,
+    /// Kept for future fan-in usage; currently receivers subscribe directly.
+    #[allow(dead_code)]
+    broadcast_rx: Arc<Mutex<Receiver<Message>>>,
+    active_alerts: Arc<Mutex<Vec<SentinelAlert>>>,
+    /// PostgreSQL connection pool, shared across handlers/services.
+    /// (Currently unused by routes; consumed by services from Phase 2 onwards.)
+    #[allow(dead_code)]
+    db: PgPool,
+    /// Valkey/Redis connection pool for the probe job queue.
+    /// (Currently unused by routes; consumed by the scheduler/worker in Phase 2.)
+    #[allow(dead_code)]
+    redis: queue::RedisPool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let config = Config::from_env().unwrap_or_else(|e| panic!("invalid configuration: {e}"));
+    pub broadcast_tx: Sender<Message>,
+    pub broadcast_rx: Arc<Receiver<Message>>,
+    pub active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
+    pub shutdown_token: CancellationToken,
+
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| config.log_level.clone().into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // database connection + migrations
+    let db_pool = db::connect(&config.database_url)
+        .await
+        .unwrap_or_else(|e| panic!("could not connect to database: {e}"));
+    db::run_migrations(&db_pool)
+        .await
+        .unwrap_or_else(|e| panic!("database migrations failed: {e}"));
+    tracing::info!("database connected and migrations up to date");
+
+    // Valkey/Redis queue connection + health check.
+    // Phase 1 keeps the server booting without a reachable Valkey — the queue
+    // is not consumed yet; the scheduler/worker (Phase 2) will make it mandatory.
+    let redis_pool = queue::connect(&config.redis_url)
+        .unwrap_or_else(|e| panic!("could not create redis pool: {e}"));
+    match queue::health_check(&redis_pool).await {
+        Ok(()) => tracing::info!("valkey/redis reachable at {}", config.redis_url),
+        Err(e) => tracing::warn!(
+            "valkey/redis health check failed ({}): {e} — continuing without queue",
+            config.redis_url
+        ),
+    }
+
+    // share state
+    let (tx, rx) = broadcast::channel(32);
+    let active_alerts: Vec<SentinelAlert> = vec![
+        SentinelAlert {
+            id: "1".to_string(),
+            atype: AlertType::New,
+            name: "test1".to_string(),
+            performance: 300,
+            expected: 150,
+            up: true,
+            reason: "slow performance".to_string(),
+            error: None,
+        },
+        SentinelAlert {
+            id: "2".to_string(),
+            atype: AlertType::New,
+            name: "test2".to_string(),
+            performance: 150,
+            expected: 150,
+            up: false,
+            reason: "service down".to_string(),
+            error: None,
+        },
+    ];
+    let app = AppState {
+        broadcast_tx: Arc::new(Mutex::new(tx)),
+        broadcast_rx: Arc::new(Mutex::new(rx)),
+        active_alerts: Arc::new(Mutex::new(active_alerts)),
+        db: db_pool,
+        redis: redis_pool,
     let config = Config::load();
 
     // Create broadcast channel for WebSocket messages

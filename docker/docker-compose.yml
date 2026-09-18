@@ -1,0 +1,64 @@
+services:
+  postgres-gs:
+    hostname: postgres-gs
+    image: postgres:18.6-trixie
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: gis_sentinel
+    networks:
+      - dev-net
+
+  # Valkey (Redis-compatible) — probe job queue + alerts Pub/Sub (task 1.2)
+  valkey-gs:
+    hostname: valkey-gs
+    image: valkey/valkey:8.1.3-alpine
+    ports:
+      - "6379:6379"
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dev-net
+
+  # pgAdmin — Postgres inspection UI (http://localhost:5050)
+  pgadmin:
+    image: dpage/pgadmin4:9
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: dev@gis-sentinel.local
+      PGADMIN_DEFAULT_PASSWORD: postgres
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    depends_on:
+      - postgres-gs
+    networks:
+      - dev-net
+
+  # Redis Commander — Valkey/Redis inspection UI (http://localhost:8081)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    ports:
+      - "8081:8081"
+    environment:
+      REDIS_HOSTS: local:valkey-gs:6379
+    depends_on:
+      valkey-gs:
+        condition: service_healthy
+    networks:
+      - dev-net
+
+volumes:
+  valkey-data:
+
+networks:
+  dev-net:
+    name: dev-net
+    external: true
