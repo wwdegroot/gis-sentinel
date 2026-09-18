@@ -43,7 +43,9 @@ async fn repository_layer_round_trip() {
     // read back
     let fetched = repo::alert_points::get(&pool, point.id).await.unwrap();
     assert_eq!(fetched.name, "smoke-test");
-    let list = repo::alert_points::list(&pool, true, 10, 0).await.unwrap();
+    let list = repo::alert_points::list(&pool, true, None, 10, 0)
+        .await
+        .unwrap();
     assert!(list.iter().any(|p| p.id == point.id));
 
     // partial update incl. setting auth_config from NULL to a value
