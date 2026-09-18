@@ -31,7 +31,7 @@ pub async fn ws_sentinel_handler(
 }
 
 /// Actual websocket statemachine (one will be spawned per connection)
-async fn handle_sentinel_socket(socket: WebSocket, _who: SocketAddr, State(app): State<AppState>) {
+async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): State<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = app.broadcast_tx.subscribe();
     let shutdown_token = app.shutdown_token.clone();
@@ -42,7 +42,10 @@ async fn handle_sentinel_socket(socket: WebSocket, _who: SocketAddr, State(app):
     // alerts.push(new_alert);
     //
     // sent active alerts to client
-    for alert in app.active_alerts.read().await.iter() {
+    // Clone the list out under a short-lived read guard so the lock is never
+    // held across an .await (std::sync lock guards are not Send).
+    let active_alerts = app.active_alerts.read().unwrap().clone();
+    for alert in active_alerts.iter() {
         let data = serde_json::to_string(alert).expect("Valid SentinelAlert data");
         debug!("Data to be sent= {}", data);
         if let Err(e) = sender.send(Message::Text(data.into())).await {
