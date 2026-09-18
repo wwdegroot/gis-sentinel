@@ -25,10 +25,13 @@ export class SentinelSocket {
                 this.alerts.push(alert);
                 break;
             case 'Update':
-                console.log('Update, TODO');
+                const updateAlertIdx = this.alerts.findIndex((a) => a.id == alert.id);
+                if (updateAlertIdx !== -1) {
+                    this.alerts[updateAlertIdx] = alert;
+                }
                 break;
             case 'Remove':
-                console.log('Remove, TODO');
+                this.alerts = this.alerts.filter((a) => a.id !== alert.id);
                 break;
             default:
                 console.log(alert);
