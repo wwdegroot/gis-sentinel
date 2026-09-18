@@ -35,7 +35,7 @@ pub async fn start_alert_generator(app: AppState) {
 
     // Populate the shared centralized vector state
     {
-        let mut active_alerts = app.active_alerts.write().await;
+        let mut active_alerts = app.active_alerts.write().unwrap();
         *active_alerts = demo_alerts.clone();
     }
 
@@ -72,7 +72,7 @@ pub async fn start_alert_generator(app: AppState) {
 
                 // 1. Lock the shared state to update the master record
                 {
-                    let mut active_alerts = app.active_alerts.write().await;
+                    let mut active_alerts = app.active_alerts.write().unwrap();
                     if let Some(alert) = active_alerts.iter_mut().find(|a| a.id == "1") {
                         alert.performance = new_perf_1;
                         alert.reason = new_reason_1;
