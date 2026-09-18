@@ -1,62 +1,54 @@
 pub mod config;
 pub mod handlers;
+pub mod probe;
 pub mod schema;
 pub mod workers;
 
 use crate::config::Config;
 use crate::handlers::{
-    generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
+    alert_points_api, generic::static_handler, sentinel_ws::ws_sentinel_handler,
+    websockets::ws_handler,
 };
-use backend::config::Config;
 use backend::db;
 use backend::queue;
 
-use axum::extract::ws::Message;
-use axum::routing::{get, Router};
-use schema::{AlertType, SentinelAlert};
-use sqlx::PgPool;
 use crate::workers::alert_workers;
 use anyhow::Result;
 use axum::extract::ws::Message;
 use axum::routing::{get, Router};
-use schema::SentinelAlert;
+use schema::{AlertType, SentinelAlert};
+use sqlx::PgPool;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::signal;
-use tokio::sync::{
-    broadcast::{self, Receiver, Sender},
-    RwLock,
-};
+use tokio::sync::broadcast::{self, Sender};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    broadcast_tx: Arc<Mutex<Sender<Message>>>,
-    /// Kept for future fan-in usage; currently receivers subscribe directly.
-    #[allow(dead_code)]
-    broadcast_rx: Arc<Mutex<Receiver<Message>>>,
-    active_alerts: Arc<Mutex<Vec<SentinelAlert>>>,
+    // broadcast::Sender is Send + Sync and all its methods take &self, so a
+    // plain Arc suffices for sharing it across handlers/workers. New receivers
+    // are created via `subscribe()` (fan-out); re-derive a Receiver on demand
+    // if fan-in is ever needed.
+    broadcast_tx: Arc<Sender<Message>>,
+    active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
     /// PostgreSQL connection pool, shared across handlers/services.
-    /// (Currently unused by routes; consumed by services from Phase 2 onwards.)
-    #[allow(dead_code)]
+    /// (Used by the alert-points REST API; queue consumers follow in Phase 2.2/2.3.)
     db: PgPool,
     /// Valkey/Redis connection pool for the probe job queue.
     /// (Currently unused by routes; consumed by the scheduler/worker in Phase 2.)
     #[allow(dead_code)]
     redis: queue::RedisPool,
+    shutdown_token: CancellationToken,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    let config = Config::from_env().unwrap_or_else(|e| panic!("invalid configuration: {e}"));
-    pub broadcast_tx: Sender<Message>,
-    pub broadcast_rx: Arc<Receiver<Message>>,
-    pub active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
-    pub shutdown_token: CancellationToken,
 
+    let config = Config::load();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -88,7 +80,6 @@ async fn main() -> Result<()> {
     }
 
     // share state
-    let (tx, rx) = broadcast::channel(32);
     let active_alerts: Vec<SentinelAlert> = vec![
         SentinelAlert {
             id: "1".to_string(),
@@ -111,23 +102,16 @@ async fn main() -> Result<()> {
             error: None,
         },
     ];
-    let app = AppState {
-        broadcast_tx: Arc::new(Mutex::new(tx)),
-        broadcast_rx: Arc::new(Mutex::new(rx)),
-        active_alerts: Arc::new(Mutex::new(active_alerts)),
-        db: db_pool,
-        redis: redis_pool,
-    let config = Config::load();
 
     // Create broadcast channel for WebSocket messages
-    let (broadcast_tx, broadcast_rx) = broadcast::channel(32);
-
+    let (tx, _rx) = broadcast::channel(32);
     // Cancellation token for graceful shutdown
     let shutdown_token = CancellationToken::new();
     let app_state = AppState {
-        broadcast_tx: broadcast_tx,
-        broadcast_rx: Arc::new(broadcast_rx),
-        active_alerts: Arc::new(RwLock::new(vec![])),
+        broadcast_tx: Arc::new(tx),
+        active_alerts: Arc::new(RwLock::new(active_alerts)),
+        db: db_pool,
+        redis: redis_pool,
         shutdown_token: shutdown_token.clone(),
     };
 
@@ -138,6 +122,7 @@ async fn main() -> Result<()> {
         .fallback(static_handler)
         .route("/ws", get(ws_handler))
         .route("/ws/sentinel", get(ws_sentinel_handler))
+        .nest("/api/v1/alert-points", alert_points_api::router())
         .with_state(app_state.clone())
         .layer(
             TraceLayer::new_for_http()
