@@ -2,7 +2,6 @@ use crate::db::models::{AlertPoint, ServiceType};
 use crate::db::models::{NewAlertPoint, UpdateAlertPoint};
 use sqlx::PgPool;
 use uuid::Uuid;
-
 /// Insert a new alert point. The client-side generated UUID v7 is stored as-is.
 pub async fn create(pool: &PgPool, new: NewAlertPoint) -> Result<AlertPoint, sqlx::Error> {
     let id = Uuid::now_v7();
@@ -50,10 +49,14 @@ pub async fn create(pool: &PgPool, new: NewAlertPoint) -> Result<AlertPoint, sql
     .await
 }
 
-/// List alert points, optionally only the enabled ones, ordered by creation.
+/// List alert points with optional filtering and pagination, ordered by creation.
+///
+/// `enabled_only` restricts to enabled points, `service_type` (when given)
+/// filters on the GIS service type. Pagination is `limit`/`offset` based.
 pub async fn list(
     pool: &PgPool,
     enabled_only: bool,
+    service_type: Option<ServiceType>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<AlertPoint>, sqlx::Error> {
@@ -74,15 +77,37 @@ pub async fn list(
             created_at,
             updated_at
         FROM alert_points
-        WHERE (NOT $1::bool) OR enabled
+        WHERE ((NOT $1::bool) OR enabled)
+          AND ($2::text IS NULL OR service_type = $2::text)
         ORDER BY created_at, id
-        LIMIT $2 OFFSET $3
+        LIMIT $3 OFFSET $4
         "#,
         enabled_only,
+        service_type as Option<ServiceType>,
         limit,
         offset,
     )
     .fetch_all(pool)
+    .await
+}
+
+/// Count alert points matching the same filter as [`list`] (for pagination totals).
+pub async fn count(
+    pool: &PgPool,
+    enabled_only: bool,
+    service_type: Option<ServiceType>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT count(*)::bigint AS "count!"
+        FROM alert_points
+        WHERE ((NOT $1::bool) OR enabled)
+          AND ($2::text IS NULL OR service_type = $2::text)
+        "#,
+        enabled_only,
+        service_type as Option<ServiceType>,
+    )
+    .fetch_one(pool)
     .await
 }
 
