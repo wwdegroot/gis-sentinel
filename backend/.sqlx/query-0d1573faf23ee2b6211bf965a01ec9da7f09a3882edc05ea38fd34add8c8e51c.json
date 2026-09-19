@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO active_alerts (alert_point_id, alert_type, reason)\n        VALUES ($1, $2, $3)\n        RETURNING\n            id,\n            alert_point_id,\n            alert_type AS \"alert_type: AlertType\",\n            reason,\n            triggered_at,\n            resolved_at\n        ",
+  "query": "\n        INSERT INTO active_alerts (alert_point_id, alert_type, status, reason)\n        VALUES ($1, $2, $3, $4)\n        RETURNING id, alert_point_id, alert_type AS \"alert_type: AlertType\", status AS \"status: ServiceStatus\", reason, triggered_at, resolved_at\n        ",
   "describe": {
     "columns": [
       {
@@ -20,16 +20,21 @@
       },
       {
         "ordinal": 3,
-        "name": "reason",
+        "name": "status: ServiceStatus",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "triggered_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "resolved_at",
         "type_info": "Timestamptz"
       }
@@ -37,6 +42,7 @@
     "parameters": {
       "Left": [
         "Uuid",
+        "Text",
         "Text",
         "Text"
       ]
@@ -47,8 +53,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "8debfe7fa1003aadbcf391703579856b263b4ad69de9b51f2bc909a23b49f5c3"
+  "hash": "0d1573faf23ee2b6211bf965a01ec9da7f09a3882edc05ea38fd34add8c8e51c"
 }

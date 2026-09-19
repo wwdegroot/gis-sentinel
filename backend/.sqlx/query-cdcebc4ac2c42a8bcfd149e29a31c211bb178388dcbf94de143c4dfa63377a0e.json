@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            a.id,\n            a.alert_point_id,\n            a.alert_type AS \"alert_type: AlertType\",\n            a.status AS \"status: ServiceStatus\",\n            a.reason,\n            a.triggered_at,\n            p.name,\n            p.url,\n            p.service_type AS \"service_type: ServiceType\",\n            p.expected_response_time_ms\n        FROM active_alerts a\n        JOIN alert_points p ON p.id = a.alert_point_id\n        WHERE a.resolved_at IS NULL\n        ORDER BY a.triggered_at DESC, a.id DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "alert_point_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "alert_type: AlertType",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "status: ServiceStatus",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "triggered_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "service_type: ServiceType",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "expected_response_time_ms",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cdcebc4ac2c42a8bcfd149e29a31c211bb178388dcbf94de143c4dfa63377a0e"
+}

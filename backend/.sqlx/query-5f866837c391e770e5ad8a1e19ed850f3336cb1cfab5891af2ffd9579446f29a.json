@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id,\n            name,\n            url,\n            service_type AS \"service_type: ServiceType\",\n            check_interval_seconds,\n            expected_response_time_ms,\n            http_method AS \"http_method: _\",\n            custom_headers,\n            auth_config,\n            enabled,\n            created_at,\n            updated_at\n        FROM alert_points\n        WHERE ((NOT $1::bool) OR enabled)\n          AND ($2::text IS NULL OR service_type = $2::text)\n        ORDER BY created_at, id\n        LIMIT $3 OFFSET $4\n        ",
+  "query": "\n        UPDATE alert_points SET\n            name = COALESCE($2, name),\n            url = COALESCE($3, url),\n            service_type = COALESCE($4, service_type),\n            check_interval_seconds = COALESCE($5, check_interval_seconds),\n            expected_response_time_ms = COALESCE($6, expected_response_time_ms),\n            http_method = COALESCE($7, http_method),\n            custom_headers = COALESCE($10, custom_headers),\n            auth_config = CASE WHEN $8::bool THEN $9::jsonb ELSE auth_config END,\n            enabled = COALESCE($11, enabled)\n        WHERE id = $1\n        RETURNING\n            id,\n            name,\n            url,\n            service_type AS \"service_type: ServiceType\",\n            check_interval_seconds,\n            expected_response_time_ms,\n            http_method AS \"http_method: _\",\n            custom_headers,\n            auth_config,\n            enabled,\n            created_at,\n            updated_at,\n            last_checked_at\n        ",
   "describe": {
     "columns": [
       {
@@ -62,14 +62,26 @@
         "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "last_checked_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Bool",
+        "Uuid",
         "Text",
-        "Int8",
-        "Int8"
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Text",
+        "Bool",
+        "Jsonb",
+        "Jsonb",
+        "Bool"
       ]
     },
     "nullable": [
@@ -84,8 +96,9 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "02561d03c908a4b5eb7dd436cd2ca85a6d332ad07faa41158482108b0f999625"
+  "hash": "5f866837c391e770e5ad8a1e19ed850f3336cb1cfab5891af2ffd9579446f29a"
 }
