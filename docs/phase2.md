@@ -2,7 +2,7 @@
 
 Covers `tasks.md` → Phase 2: **2.1 API Service (Alert Points CRUD)** · **2.2 Scheduler (Queue Producer)** · **2.3 Worker (Probe Executor & Evaluator)** · **2.4 WebSocket & Real-time Alert Hub** · **2.5 Technical Debt & Fixes**
 
-Status: 🚧 **IN PROGRESS** — §2 (task 2.1) implemented & live-verified 2026-09-18; §3–§5 planned. This document lists every change required to implement Phase 2, grounded in the code that exists after Phase 1 (see `phase1.md`).
+Status: ✅ **PHASE 2 COMPLETE** — 2.1–2.5 all implemented & live-verified. Remaining Phase-2 follow-ups are tracked as Phase-3/4 dependencies (frontend `processMessage` update, multi-instance fan-out via Redis Pub/Sub).
 
 ---
 
@@ -15,12 +15,11 @@ Already in place from Phase 1 — Phase 2 work plugs into these:
 | DB schema (migrations) | `backend/migrations/0001_initial_schema.sql` | `alert_points` (UUID v7 PK), `probe_results` (BIGINT identity), `active_alerts` (partial unique index: at most one open alert per point) |
 | Models | `backend/src/db/models.rs` | `AlertPoint`, `NewAlertPoint`, `UpdateAlertPoint`, `ProbeResult`, `NewProbeResult`, `ActiveAlert`, `NewActiveAlert`, `ServiceType`, `HttpMethod`, `AlertType` |
 | Repository layer | `backend/src/db/repo/{alert_points,probe_results,active_alerts}.rs` | CRUD + `list_recent`, `uptime_percentage`, `insert`/`resolve`/`list_open`/`latest_open` for alerts — **all already compile-time checked with `.sqlx` offline cache** |
-| Queue layer | `backend/src/queue/mod.rs` | `ProbeJob` wire contract (`target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms`), `enqueue_probe_job` (LPUSH), `dequeue_probe_job` (BRPOP), `ALERTS_PUBSUB_CHANNEL = "sentinel:alerts"`, deadpool pool + health check |
+| Queue layer | `backend/src/queue/mod.rs` | `ProbeJob` wire contract (`target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms`), `enqueue_probe_job` (LPUSH), `dequeue_probe_job` (BRPOP), in-flight gate (`try_acquire_inflight`/`release_inflight`), `ALERTS_PUBSUB_CHANNEL = "sentinel:alerts"`, deadpool pool + health check |
 | Config | `backend/src/config.rs` | typed `Config` via env: `APP_HOST`, `APP_PORT`, `APP_CORS_ORIGINS`, `FRONTEND_BUILD_DIR`, `DATABASE_URL`, `REDIS_URL`, `LOG_LEVEL` |
 | `AppState` | `backend/src/main.rs` | holds `broadcast_tx: Arc<Sender<Message>>`, `active_alerts: Arc<RwLock<Vec<SentinelAlert>>>` (demo), `db: PgPool`, `redis: RedisPool`, `shutdown_token: CancellationToken` |
-| WebSocket handlers | `backend/src/handlers/{sentinel_ws,websockets}.rs` | `sentinel_ws` = mock alert streaming (demo data); `websockets` = legacy echo example to be removed (task 2.4) |
-| Demo worker | `backend/src/workers/alert_workers.rs` | generates fake `SentinelAlert`s every 5s — to be replaced by real scheduler/worker |
-| Demo wire schema | `backend/src/schema.rs` | `SentinelAlert` with `id: String`, `performance`, `expected`, `up`, `reason` — frontend already consumes this shape |
+| WebSocket handlers | `backend/src/handlers/sentinel_ws.rs` | ✅ task 2.4: snapshot-on-connect + live `WsMessage` events |
+| Real-time pipeline | `backend/src/{workers,ws_protocol}` | ✅ tasks 2.2–2.4: scheduler → queue → probe worker → `AlertEvent` broadcast; demo code removed |
 
 **Key gaps to close:** REST API routes, scheduler, probe worker, real alert evaluation, real WS data source, graceful shutdown, tracing IDs. **`reqwest` is not yet a dependency** and must be added.
 
@@ -113,7 +112,20 @@ let app = Router::new()
 
 ---
 
-## 3. Task 2.2 — Scheduler Service (Queue Producer)
+## 3. Task 2.2 — Scheduler Service (Queue Producer) ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):** built per plan with `last_checked_at`
+> (Q1-a) in migration `0002_scheduler_state.sql` (partial index on enabled rows).
+> - `workers/scheduler.rs`: 1 s–tick loop (default `SCHEDULER_TICK_SECONDS=5`),
+>   `list_due` → `SET NX EX` gate → `ProbeJob{timeout_ms = PROBE_TIMEOUT_MS_DEFAULT}` →
+>   `LPUSH` → `touch_last_checked`. Gate released on enqueue failure; worker (2.3)
+>   releases on completion.
+> - `AppState` now carries typed `Config` (scheduler knobs).
+> - `.env.example` updated with `SCHEDULER_TICK_SECONDS`, `PROBE_TIMEOUT_MS_DEFAULT`.
+> - Live verification: due query → enqueue (pending 0→1) → "no due targets" while
+>   interval pending (proves `touch_last_checked`) → gate holds until TTL expiry
+>   (40 s) → re-enqueue (pending 2) → SIGINT graceful stop. Queue + DB smoke tests
+>   pass against live Valkey/Postgres.
 
 ### 3.1.1 New module
 
@@ -154,7 +166,30 @@ backend/src/workers/
 
 ---
 
-## 4. Task 2.3 — Worker Service (GIS Probe Executor & Evaluator)
+## 4. Task 2.3 — Worker Service (GIS Probe Executor & Evaluator) ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):**
+> - `ProbeJob` extended per Q2-a: `target_name`, `http_method`, `custom_headers`,
+>   `auth` (tagged `AuthSpec` enum) — all `#[serde(default)]` for queue compatibility.
+> - `probe/gis.rs`: `build_probe_url` (GetCapabilities / `f=pjson` params, case-
+>   insensitive param replacement), `check_service_response` (quick-xml root check,
+>   ServiceException detection, OAF `links`, ArcGIS `error` key).
+> - `probe/evaluate.rs`: `Evaluator` state machine (Down after `PROBE_FAILURE_THRESHOLD`
+>   consecutive failures; Degraded on latency > SLA; recovery on first success;
+>   `AlertAction::{None, RaiseNew, UpdateOpen, Resolve}`).
+> - **Shared evaluator fix found in live testing:** N workers each keeping their own
+>   in-memory state caused duplicate `New` raises (unique constraint caught it).
+>   The evaluator is now one `Arc<Mutex<..>>` in `AppState`; plus a defensive
+>   fallback downgrades a racing `RaiseNew` to an update of the open alert.
+> - `active_alerts::update_open` added for `Update` events.
+> - `ws_protocol.rs` (`AlertEvent`, `ServiceStatus`, `WsMessage` envelope) — the
+>   worker broadcasts serialized `AlertEvent`s; `sentinel_ws` switches to the
+>   envelope in task 2.4.
+> - Config: `WORKER_CONCURRENCY=2`, `PROBE_FAILURE_THRESHOLD=2` (min 1).
+> - Live verification: dead target → 1× `New`/Down broadcast + probe rows persisted;
+>   healthy target → probes persisted, no alert; repointing the dead target →
+>   `Remove`/Healthy broadcast; zero worker errors after the shared-evaluator fix;
+>   stale jobs for deleted targets fail soft (FK violation logged, gate released).
 
 ### 4.1.1 New modules
 
@@ -226,7 +261,35 @@ Transitions and actions:
 
 ---
 
-## 5. Task 2.4 — WebSocket & Real-time Alert Hub
+## 5. Task 2.4 — WebSocket & Real-time Alert Hub ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):**
+> - **Migration `0003_alert_status.sql`**: `active_alerts.status` (HEALTHY/DEGRADED/DOWN,
+>   default+backfill `DOWN`) so snapshots report the true current state.
+> - `ServiceStatus` moved to `db/models.rs` (repo layer lives in the lib crate);
+>   `ws_protocol` re-exports it. DB form UPPERCASE, client JSON form snake_case.
+> - `repo::active_alerts::list_open_with_point` — JOIN with `alert_points` for the
+>   snapshot payload (`name`, `url`, `service_type`, `expected_response_time_ms`).
+> - `sentinel_ws.rs`: on connect sends `WsMessage::Snapshot` built from the DB,
+>   then forwards live events from the broadcast channel; echo/ping demo logic
+>   removed. On `Lagged(n)` the client keeps the connection (live events resume;
+>   full re-sync optimization deferred).
+> - Worker broadcasts `WsMessage::Alert(event)` now. **Verified wire shapes**
+>   (serde internally-tagged enum flattens the event fields):
+>
+>   ```json
+>   {"type":"snapshot","alerts":[{"alert_id":11,"status":"down","alert_type":"New",...}]}
+>   {"type":"alert","alert_id":12,"alert_point_id":"…","alert_type":"New","status":"down",...}
+>   ```
+>
+>   (frontend task 3.1 must handle the flattened `alert` fields).
+> - **Demo code deleted**: `handlers/websockets.rs` (+ `/ws` route), `schema.rs`,
+>   `workers/alert_workers.rs`; `AppState` no longer holds the in-memory demo
+>   alert vec — PostgreSQL is the source of truth for snapshots.
+> - Live verification (node native WebSocket client): snapshot-on-connect with the
+>   open alert (`status:down`), live `Alert` `New`/Down event received on an open
+>   connection, `Remove`/Healthy after repointing the target; DB smoke + queue
+>   smoke pass; 21 unit tests; clippy/fmt clean.
 
 ### 5.1.1 Replace the demo wire schema (`src/schema.rs`)
 
@@ -300,7 +363,29 @@ The "full active alert list" no longer lives in memory — it is read from Postg
 
 ---
 
-## 6. Task 2.5 — Technical Debt & Fixes
+## 6. Task 2.5 — Technical Debt & Fixes ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):**
+> - ✅ Cross-platform embed path (done in Phase 1).
+> - **Graceful shutdown** (reviewed the merged implementation; it was correct):
+>   SIGINT/SIGTERM → `CancellationToken.cancel()` → axum drains HTTP and upgraded
+>   WS connections (handlers abort their tasks on the token and send `Close`
+>   frames). Added in this pass: scheduler/worker `JoinHandle`s are now awaited
+>   after the server stops (bounded at 30 s, warn-and-continue), then
+>   `db_pool.close().await` + `redis_pool.close()`; token cancel is idempotent
+>   so server-stop-for-any-reason also reaches the background tasks.
+> - **Request tracing IDs**: `tower-http` `request-id` feature —
+>   `SetRequestIdLayer` (server-generated UUID v4, honoring incoming
+>   `x-request-id`) → `TraceLayer` with a custom `http_request` span carrying
+>   `request_id`/`method`/`uri` → `PropagateRequestIdLayer` echoes the id on the
+>   response. Handler logs inherit the span, e.g.:
+>   `http_request{request_id=my-trace-42 method=POST uri=/api/v1/alert-points}: alert point created`
+> - Uniform API error handling was delivered with task 2.1 (`ApiError`).
+> - Live verification: header set/honored/propagated; request_id in handler logs;
+>   SIGINT with an open WebSocket → snapshot delivered, close frame `code=1000`,
+>   all 3 background tasks joined, pools closed, `Server shut down complete`.
+>   (Note: lingering zombie PIDs after runs are a sandbox artifact — PID 1 here
+>   does not reap orphans; the processes themselves exited cleanly.)
 
 - [x] Cross-platform embed path (done in Phase 1).
 - [ ] **Graceful shutdown hardening** (`main.rs`):
@@ -322,28 +407,28 @@ The "full active alert list" no longer lives in memory — it is read from Postg
 | File | Action |
 |---|---|
 | `Cargo.toml` | add `reqwest`, (opt) `validator`, `quick-xml`, `url`; dev-dep `wiremock` |
-| `migrations/0002_scheduler_state.sql` | **NEW** — `ALTER TABLE alert_points ADD COLUMN last_checked_at TIMESTAMPTZ` (+ index on `enabled, last_checked_at`) |
+| `migrations/0002_scheduler_state.sql` | ✅ DONE — `alert_points.last_checked_at TIMESTAMPTZ` + partial index on enabled rows |
 | `src/main.rs` | mount `/api/v1/alert-points` nest; spawn scheduler + N probe workers + pubsub bridge; remove demo worker spawn; graceful shutdown wiring |
 | `src/lib.rs` | add `pub mod ws_protocol; pub mod probe;` |
-| `src/config.rs` | add scheduler/worker config knobs |
+| `src/config.rs` | ✅ DONE — `SCHEDULER_TICK_SECONDS`, `PROBE_TIMEOUT_MS_DEFAULT` (+ `.env.example`) |
 | `src/db/models.rs` | add `last_checked_at` to `AlertPoint`; add `ServiceStatus` enum; (opt) `AuthConfig` typed deserializer; add `ProbeJob`-support types if ProbeJob is extended |
-| `src/db/repo/alert_points.rs` | add `list_due(pool)` (or `last_checked_at`-based query); add `touch_last_checked(id)` |
+| `src/db/repo/alert_points.rs` | ✅ DONE — `list_due(pool)` + `touch_last_checked(id)`; all SELECTs include `last_checked_at` |
 | `src/db/repo/active_alerts.rs` | add `update_reason(point_id, reason)` for `Update` events; add `list_open_with_point` JOIN query |
 | `src/queue/mod.rs` | (opt) extend `ProbeJob` with method/headers/auth; add `publish_alert_event()` + `subscribe_alerts()` Pub/Sub helpers |
 | `src/handlers/mod.rs` | add `alert_points_api`, `error` modules |
 | `src/handlers/alert_points_api.rs` | **NEW** — 6 REST handlers + router + pagination/filter params |
 | `src/handlers/error.rs` | **NEW** — `ApiError` + `IntoResponse` |
-| `src/handlers/sentinel_ws.rs` | snapshot-on-connect from DB, new `WsMessage` protocol, remove demo reads |
-| `src/handlers/websockets.rs` | **DELETE** |
-| `src/handlers/mod.rs` | drop `websockets` |
-| `src/schema.rs` | **DELETE** (replaced by `ws_protocol.rs`) |
-| `src/ws_protocol.rs` | **NEW** — `WsMessage::{Snapshot, Alert}`, `AlertEvent`, `ServiceStatus` |
-| `src/probe/mod.rs`, `src/probe/client.rs`, `src/probe/gis.rs`, `src/probe/evaluate.rs` | **NEW** — probe execution + evaluation engine |
-| `src/workers/mod.rs` | add `scheduler`, `probe_worker`, `pubsub_bridge` |
-| `src/workers/scheduler.rs` | **NEW** — due-target polling + in-flight gate + enqueue |
-| `src/workers/probe_worker.rs` | **NEW** — BRPOP loop → probe → evaluate → persist → publish |
-| `src/workers/pubsub_bridge.rs` | **NEW** — Redis Pub/Sub → tokio broadcast fan-in |
-| `src/workers/alert_workers.rs` | **DELETE** |
+| `src/handlers/sentinel_ws.rs` | ✅ DONE — snapshot-on-connect from DB, `WsMessage` protocol, demo reads/echo removed |
+| `src/handlers/websockets.rs` | ✅ DELETED |
+| `src/handlers/mod.rs` | ✅ DONE — `websockets` removed |
+| `src/schema.rs` | ✅ DELETED (replaced by `ws_protocol.rs`) |
+| `src/ws_protocol.rs` | ✅ DONE — `WsMessage::{Snapshot, Alert}`, `AlertEvent`; `ServiceStatus` lives in `db/models.rs` and is re-exported |
+| `src/probe/mod.rs`, `src/probe/client.rs`, `src/probe/gis.rs`, `src/probe/evaluate.rs` | ✅ DONE — probe execution + evaluation engine |
+| `src/workers/mod.rs` | ✅ DONE — `scheduler`, `probe_worker` |
+| `src/workers/scheduler.rs` | ✅ DONE — due-target polling + in-flight gate + enqueue; spawned from `main` |
+| `src/workers/probe_worker.rs` | ✅ DONE — BRPOP loop → probe → evaluate → persist → broadcast (in `WsMessage::Alert` envelope) → gate release |
+| `src/workers/pubsub_bridge.rs` | deferred (multi-instance upgrade path; single-process tokio broadcast suffices for Phase 2) |
+| `src/workers/alert_workers.rs` | ✅ DELETED |
 | `tests/queue_smoke.rs` | keep; add `tests/api_alert_points.rs`, `tests/probe_eval.rs` (unit) |
 
 ---

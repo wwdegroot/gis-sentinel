@@ -2,6 +2,8 @@
 
 This document outlines the roadmap and missing components for **GIS Sentinel**, based on the architecture described in [README.md](./README.md) and the current state of `backend/` and `frontend/`.
 
+> **Progress:** Phase 1 ✅ (`phase1.md`) · Phase 2 ✅ (`phase2.md`) · Phase 3 ✅ (`phase3.md`) · Phase 4+ pending
+
 ---
 
 ## 📊 Current State vs Target Architecture Gap Analysis
@@ -60,80 +62,77 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
   - [x] Implement request payload validation (valid URLs, positive intervals/thresholds, recognized GIS service types).
   - Note: axum 0.8 nested routes match `/api/v1/alert-points` but **not** `/api/v1/alert-points/` (trailing slash falls through to the SPA fallback).
 
-- [ ] **2.2 Scheduler Service (Queue Producer)**
-  - [ ] Implement background scheduler loop (using `tokio::time::interval` or `tokio-cron-scheduler`).
-  - [ ] Periodically query enabled `alert_points` from database based on their `check_interval_seconds`.
-  - [ ] Push probe jobs into the Valkey/Redis queue avoiding duplicate in-flight checks.
+- [x] **2.2 Scheduler Service (Queue Producer)** ✅ implemented (see `phase2.md` §3)
+  - [x] Implement background scheduler loop (using `tokio::time::interval` or `tokio-cron-scheduler`). (`workers/scheduler.rs`, plain `interval` + `CancellationToken`)
+  - [x] Periodically query enabled `alert_points` from database based on their `check_interval_seconds`. (`alert_points::list_due` via `last_checked_at`, migration `0002_scheduler_state.sql`)
+  - [x] Push probe jobs into the Valkey/Redis queue avoiding duplicate in-flight checks. (`SET NX EX` gate `sentinel:inflight:{target_id}` in `queue::try_acquire_inflight`; TTL = interval + 30 s, worker releases explicitly in 2.3)
 
-- [ ] **2.3 Worker Service (GIS Probe Executor & Evaluator)**
-  - [ ] Implement worker loop pulling jobs from the Redis queue.
-  - [ ] Build GIS probe client using `reqwest`:
-    - Support HTTP GET/POST with customizable headers/timeout.
-    - GIS-specific checks (e.g. `GetCapabilities` XML parsing for WMS/WFS, health ping for ArcGIS Server).
-    - Measure high-resolution latency (TTFB and total transfer duration).
-  - [ ] Implement alert state evaluation logic:
-    - Check if service is unreachable or returns HTTP 4xx/5xx errors.
-    - Compare actual latency against `expected_response_time_ms`.
-    - Detect state transitions (`Up` -> `Down`/`Degraded`, `Down` -> `Recovered`).
-  - [ ] Persist probe metrics to PostgreSQL.
-  - [ ] Push state transition alerts to Redis Pub/Sub or backend broadcast channel.
+- [x] **2.3 Worker Service (GIS Probe Executor & Evaluator)** ✅ implemented (see `phase2.md` §4)
+  - [x] Implement worker loop pulling jobs from the Redis queue. (`workers/probe_worker.rs`, BRPOP + `CancellationToken` + `WORKER_CONCURRENCY` instances sharing one `Evaluator`)
+  - [x] Build GIS probe client using `reqwest`:
+    - [x] Support HTTP GET/POST with customizable headers/timeout. (`ProbeJob` carries method/headers/auth — Q2-a)
+    - [x] GIS-specific checks (e.g. `GetCapabilities` XML parsing for WMS/WFS, health ping for ArcGIS Server). (`probe/gis.rs` via quick-xml)
+    - [x] Measure high-resolution latency (TTFB and total transfer duration). (`Instant`-based; total persisted, TTFB logged at debug)
+  - [x] Implement alert state evaluation logic:
+    - [x] Check if service is unreachable or returns HTTP 4xx/5xx errors. (transport + GIS service-level checks)
+    - [x] Compare actual latency against `expected_response_time_ms`. (Degraded status)
+    - [x] Detect state transitions (`Up` -> `Down`/`Degraded`, `Down` -> `Recovered`). (with `PROBE_FAILURE_THRESHOLD` hysteresis)
+  - [x] Persist probe metrics to PostgreSQL. (every probe via `probe_results::insert`)
+  - [x] Push state transition alerts to Redis Pub/Sub or backend broadcast channel. (tokio broadcast `AlertEvent` per Q3-b; Pub/Sub is the 2.4 upgrade path)
 
-- [ ] **2.4 WebSocket & Real-time Alert Hub**
-  - [ ] Connect WebSocket broadcaster to real-time worker events (via Redis PubSub or Tokio broadcast).
-  - [ ] Implement initial state synchronization when frontend clients connect (send full active alert list).
-  - [ ] Handle incremental alert lifecycle events:
-    - `New`: Newly triggered outage or degradation.
-    - `Update`: Status changed (e.g., latency worsened or partial recovery).
-    - `Remove`: Service resolved / back to healthy state.
-  - [ ] Clean up legacy demo code in `handlers/websockets.rs` and consolidate into `handlers/sentinel_ws.rs`.
+- [x] **2.4 WebSocket & Real-time Alert Hub** ✅ implemented (see `phase2.md` §5)
+  - [x] Connect WebSocket broadcaster to real-time worker events (via Redis PubSub or Tokio broadcast). (tokio broadcast; worker publishes `WsMessage::Alert` JSON)
+  - [x] Implement initial state synchronization when frontend clients connect (send full active alert list). (`active_alerts::list_open_with_point` JOIN → `Snapshot`, status persisted via migration `0003`)
+  - [x] Handle incremental alert lifecycle events: `New` / `Update` / `Remove`. (evaluation → DB action → broadcast, task 2.3)
+  - [x] Clean up legacy demo code in `handlers/websockets.rs` and consolidate into `handlers/sentinel_ws.rs`. (deleted `websockets.rs`, `schema.rs`, `workers/alert_workers.rs`; `/ws` route removed)
 
-- [ ] **2.5 Backend Technical Debt & Fixes**
+- [ ] **2.5 Backend Technical Debt & Fixes** ✅ implemented (see `phase2.md` §6)
   - [x] Fix cross-platform static asset embed path in `backend/src/handlers/generic.rs` (change `r"..\frontend\build\"` to `"../frontend/build"`). (done early as part of 1.1 — blocked all Linux builds)
-  - [ ] Add graceful shutdown handling for Tokio tasks, DB pools, and server listeners.
-  - [ ] Improve error handling and structured logging with request tracing IDs.
+  - [x] Add graceful shutdown handling for Tokio tasks, DB pools, and server listeners. (signal → `CancellationToken` → HTTP drain incl. WS close frames → background tasks joined (30 s bound) → sqlx/deadpool pools closed)
+  - [x] Improve error handling and structured logging with request tracing IDs. (`x-request-id` set/honored/propagated + stamped into `http_request` span; uniform `ApiError` JSON from 2.1)
 
 ---
 
 ## 🎨 Phase 3: Frontend Development & UI/UX
 
-- [ ] **3.1 WebSocket Client Improvements (`sentinelSocket.svelte.ts`)**
-  - [ ] Fix typo: rename `adress` to `address`.
-  - [ ] Implement `Update` and `Remove` handling in `processMessage` (update existing alert by id, remove resolved alert).
-  - [ ] Add auto-reconnect with exponential backoff and connection state indicators (Connected, Reconnecting, Disconnected).
-  - [ ] Implement dynamic WebSocket URL resolution using `window.location.host` and `ws:`/`wss:` protocols.
+- [x] **3.1 WebSocket Client Improvements (`sentinelSocket.svelte.ts`)** ✅ implemented (see `phase3.md` §1)
+  - [x] Fix typo: rename `adress` to `address`.
+  - [x] Implement `Update` and `Remove` handling in `processMessage` (update existing alert by id, remove resolved alert). (keyed by `alert_id`; snapshot fully replaces state; New is idempotent)
+  - [x] Add auto-reconnect with exponential backoff and connection state indicators (Connected, Reconnecting, Disconnected). (500 ms → 30 s cap + jitter, reset on open; `ConnectionState` + `reconnecting` getter)
+  - [x] Implement dynamic WebSocket URL resolution using `window.location.host` and `ws:`/`wss:` protocols. (`resolveWebSocketUrl()`)
 
-- [ ] **3.2 Application Layout & Navigation**
-  - [ ] Replace temporary demo root `routes/+page.svelte` with a proper landing dashboard.
-  - [ ] Add a global navigation bar in `routes/+layout.svelte`:
-    - **Dashboard** (`/sentinel` or `/`) - Real-time alerts and service status overview.
-    - **Services / Alert Points** (`/services`) - List and manage GIS endpoints.
-    - **History / Logs** (`/history`) - Historical probe records and uptime metrics.
-    - **Settings** (`/settings`) - Global thresholds and notification settings.
-  - [ ] Add dark/light mode and Tailwind theme styling.
+- [x] **3.2 Application Layout & Navigation** ✅ implemented (see `phase3.md` §2)
+  - [x] Replace temporary demo root `routes/+page.svelte` with a proper landing dashboard. (echo playground deleted; dashboard lands with 3.3)
+  - [x] Add a global navigation bar in `routes/+layout.svelte`:
+    - [x] **Dashboard** (`/` or `/`) - Real-time alerts and service status overview. (`/sentinel` client-side-redirects to `/`)
+    - [x] **Services / Alert Points** (`/services`) - List and manage GIS endpoints. (stub page; UI in 3.4)
+    - [x] **History / Logs** (`/history`) - Historical probe records and uptime metrics. (stub page; UI in 3.5)
+    - [x] **Settings** (`/settings`) - Global thresholds and notification settings. (stub with working theme control)
+  - [x] Add dark/light mode and Tailwind theme styling. (Tailwind 4 `@custom-variant dark`, `@theme inline` runtime tokens, pre-paint script, persisted toggle, dark default)
 
-- [ ] **3.3 Live Sentinel Monitoring Dashboard (`/sentinel`)**
-  - [ ] Redesign alert cards with GIS service metadata:
-    - Service name, endpoint URL, service type badge (WMS, WFS, REST).
-    - Status badge: `Healthy`, `Degraded (Slow)`, `Down (Unreachable)`.
-    - Latency bar / meter (current vs expected SLA).
-    - Failure reason / HTTP status / error snippet.
-    - Duration of current outage / alert timestamp.
-  - [ ] Summary statistics header (Total monitored, Total Healthy, Active Incidents, Average Latency).
-  - [ ] Filters by service type, status, and search query.
+- [x] **3.3 Live Sentinel Monitoring Dashboard (`/sentinel`)** ✅ implemented (see `phase3.md` §3)
+  - [x] Redesign alert cards with GIS service metadata:
+    - [x] Service name, endpoint URL, service type badge (WMS, WFS, REST).
+    - [x] Status badge: `Healthy`, `Degraded (Slow)`, `Down (Unreachable)`. (`StatusBadge`)
+    - [x] Latency bar / meter (current vs expected SLA). (`LatencyMeter`, 0–2× SLA track)
+    - [x] Failure reason / HTTP status / error snippet. (reason text on card)
+    - [x] Duration of current outage / alert timestamp. (ticking `formatDuration` from `triggered_at`)
+  - [x] Summary statistics header (Total monitored, Total Healthy, Active Incidents, Average Latency). (`SummaryStats`, total via REST, rest derived from socket state)
+  - [x] Filters by service type, status, and search query. (client-side `$derived` filtering + sorting by severity/recency)
 
-- [ ] **3.4 Alert Points Configuration Interface (`/services`)**
-  - [ ] Data table showing all monitored GIS services with quick toggles (enable/disable).
-  - [ ] Modal/Form for adding and editing alert points:
-    - Target URL, Name, GIS Service Type.
-    - Expected SLA Latency (ms), Check Interval (seconds), Timeout (seconds).
-    - Custom headers, HTTP Basic Auth / API token.
-  - [ ] "Test Now" button with immediate probe result feedback.
-  - [ ] Delete confirmation modal.
+- [x] **3.4 Alert Points Configuration Interface (`/services`)** ✅ implemented (see `phase3.md` §4)
+  - [x] Data table showing all monitored GIS services with quick toggles (enable/disable). (`ServiceTable`, optimistic toggle with rollback)
+  - [x] Modal/Form for adding and editing alert points:
+    - [x] Target URL, Name, GIS Service Type.
+    - [x] Expected SLA Latency (ms), Check Interval (seconds), Timeout (seconds). (interval + SLA; probe timeout is a backend default — field planned with per-target timeout column)
+    - [x] Custom headers, HTTP Basic Auth / API token. (key/value rows; basic/bearer/header auth kinds)
+  - [x] "Test Now" button with immediate probe result feedback. (`TestResultPanel`)
+  - [x] Delete confirmation modal. (`DeleteConfirm`)
 
-- [ ] **3.5 Historical Analytics & Service Detail View**
-  - [ ] Time-series latency charts for monitored endpoints.
-  - [ ] Uptime percentage over 24h / 7d / 30d periods.
-  - [ ] Incident log history table with export to CSV/JSON.
+- [x] **3.5 Historical Analytics & Service Detail View** ✅ implemented (see `phase3.md` §5)
+  - [x] Time-series latency charts for monitored endpoints. (`LatencyChart`, hand-rolled SVG — zero deps; SLA dashed line, red markers for failed probes, window-spanning x axis)
+  - [x] Uptime percentage over 24h / 7d / 30d periods. (`UptimeStats`, three parallel history fetches)
+  - [x] Incident log history table with export to CSV/JSON. (`IncidentTable`, client-side blob download)
 
 ---
 
@@ -173,7 +172,9 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 ## 📌 Suggested Immediate Next Steps
 
 1. ✅ **Fix cross-platform embed path** in `backend/src/handlers/generic.rs` to allow compiling on Linux/macOS. (done as part of 1.1)
-2. **Add `docker-compose.yml`** with Postgres and Valkey/Redis for local service dependencies.
+2. ✅ **Add `docker-compose.yml`** with Postgres and Valkey/Redis for local service dependencies. (done as part of 1.4)
 3. ✅ **Implement Database & Schema** for `alert_points` and connect backend via `sqlx`. (done as part of 1.1, incl. repository layer + offline query cache)
-4. **Implement REST CRUD Endpoints** in backend and build the `/services` frontend management page.
-5. **Implement Scheduler & Worker** loop to turn GIS Sentinel from mock data into a functioning monitoring engine.
+4. ✅ **Implement REST CRUD Endpoints** in backend (done as part of 2.1; the `/services` frontend page is task 3.4) and build the `/services` frontend management page.
+5. ✅ **Implement Scheduler & Worker** loop to turn GIS Sentinel from mock data into a functioning monitoring engine. (done as part of 2.2–2.4, incl. real-time WebSocket hub)
+
+→ Next up: **Phase 3 (Frontend)** — starting with task 3.1, since the backend WS wire contract changed in Phase 2.
