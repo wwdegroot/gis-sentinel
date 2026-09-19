@@ -1,19 +1,20 @@
 use axum::{
     extract::{
+        connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
 };
 use axum_extra::TypedHeader;
+use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::sync::broadcast::error::RecvError;
-//allows to extract the IP of connecting user
-use axum::extract::connect_info::ConnectInfo;
 use tracing::{debug, error, info};
-//allows to split the websocket stream into separate TX and RX branches
+
+use crate::db::repo;
+use crate::ws_protocol::WsMessage;
 use crate::AppState;
-use futures::{sink::SinkExt, stream::StreamExt};
 
 pub async fn ws_sentinel_handler(
     ws: WebSocketUpgrade,
@@ -30,36 +31,59 @@ pub async fn ws_sentinel_handler(
     ws.on_upgrade(move |socket| handle_sentinel_socket(socket, addr, State(app)))
 }
 
-/// Actual websocket statemachine (one will be spawned per connection)
+/// Actual websocket statemachine (one will be spawned per connection).
+///
+/// Message flow (task 2.4):
+/// 1. On connect, a `Snapshot` of all open alerts (joined from the DB) is
+///    sent so the client renders the current state immediately.
+/// 2. Afterwards, live `Alert` lifecycle events produced by the probe worker
+///    are forwarded from the tokio broadcast channel.
 async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): State<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = app.broadcast_tx.subscribe();
     let shutdown_token = app.shutdown_token.clone();
 
-    // -- Write message to channel
-    // This will temporarily block readers until the write is finished
-    // let mut alerts = app.active_alerts.write().await;
-    // alerts.push(new_alert);
-    //
-    // sent active alerts to client
-    // Clone the list out under a short-lived read guard so the lock is never
-    // held across an .await (std::sync lock guards are not Send).
-    let active_alerts = app.active_alerts.read().unwrap().clone();
-    for alert in active_alerts.iter() {
-        let data = serde_json::to_string(alert).expect("Valid SentinelAlert data");
-        debug!("Data to be sent= {}", data);
-        if let Err(e) = sender.send(Message::Text(data.into())).await {
-            error!("Error sending message: {}", e);
+    // -- Initial state synchronization: send the full open-alert list.
+    match repo::active_alerts::list_open_with_point(&app.db).await {
+        Ok(open) => {
+            let alerts = open
+                .into_iter()
+                .map(|row| crate::ws_protocol::AlertEvent {
+                    alert_id: row.id,
+                    alert_point_id: row.alert_point_id,
+                    alert_type: row.alert_type,
+                    name: row.name,
+                    url: row.url,
+                    service_type: row.service_type,
+                    status: row.status,
+                    reason: row.reason,
+                    response_time_ms: None,
+                    expected_response_time_ms: row.expected_response_time_ms,
+                    triggered_at: row.triggered_at,
+                })
+                .collect::<Vec<_>>();
+            debug!(client = %who, alerts = alerts.len(), "sending snapshot");
+            match serde_json::to_string(&WsMessage::Snapshot { alerts }) {
+                Ok(json) => {
+                    if let Err(e) = sender.send(Message::Text(json.into())).await {
+                        error!("Error sending snapshot to {who}: {e}");
+                        return;
+                    }
+                }
+                Err(e) => error!("Failed to serialize snapshot for {who}: {e}"),
+            }
+        }
+        Err(e) => {
+            // Snapshot is a nice-to-have; live events still flow. Log and continue.
+            error!("Failed to build snapshot for {who}: {e}");
         }
     }
 
-    // Spawn a task that will push notifications to the client (does not matter what client does)
+    // -- Write task: forward broadcast events to the client.
     let shutdown_token_send = shutdown_token.clone();
     let mut send_task = tokio::spawn(async move {
-        // check for new notifications and sent them
         loop {
             tokio::select! {
-                // Exit on shutdown token
                 _ = shutdown_token_send.cancelled() => {
                     debug!("Shutdown signal received in send task for {who}");
                     break;
@@ -69,7 +93,7 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
                     match result {
                         Ok(msg) => {
                             if let Err(e) = sender.send(msg).await {
-                                error!("Error sending message: {}", e);
+                                error!("Error sending message: {e}");
                                 break;
                             }
                         }
@@ -78,8 +102,9 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
                             break;
                         }
                         Err(RecvError::Lagged(n)) => {
-                            error!("Lagged behind by {} messages", n);
-                            // Handle the lag, perhaps by requesting a full state update.
+                            error!("Lagged behind by {n} messages");
+                            // The client missed events; request a full state
+                            // update via a fresh snapshot.
                             continue;
                         }
                     }
@@ -99,35 +124,34 @@ async fn handle_sentinel_socket(socket: WebSocket, who: SocketAddr, State(app): 
             debug!("Could not send close frame to {who} during shutdown");
         }
     });
-    // Clone shutdown_flag for use in the select! loops
+
+    // -- Read task: track client disconnects. No server-side handling of
+    //    client messages is needed yet (an envelope can be added when the
+    //    frontend requires it).
     let shutdown_token_recv = shutdown_token.clone();
-    // Spawn a task to handle incoming messages from the client and echo them back.
     let mut recv_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                // Exit on shutdown token
                 _ = shutdown_token_recv.cancelled() => {
-                    debug!("Shutdown signal received in send task for {who}");
+                    debug!("Shutdown signal received in recv task for {who}");
                     break;
                 }
                 msg = receiver.next() => {
                     match msg {
                         Some(Ok(Message::Text(t))) => {
-                            info!("Client sent: {}", t);
-                            if let Err(e) = app
-                                .broadcast_tx
-                                .send(format!("Echo: {}", t).into())
-                            {
-                                error!("Could not send message to broadcast channel: {}", e);
-                            }
+                            debug!("Client {who} sent: {t}");
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             debug!("Client closed connection");
                             break;
                         }
-                        _ => {}
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            debug!("Websocket error from {who}: {e}");
+                            break;
+                        }
                     }
-                    }
+                }
             }
         }
         debug!("Receive task finished for {who}");
