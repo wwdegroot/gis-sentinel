@@ -18,13 +18,15 @@ serde_json = "1.0.134"
 tokio = { version = "1.0", features = ["full"] }
 tokio-tungstenite = "0.27"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "request-id"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 # Valkey/Redis queue client + pooled connections (task 1.2)
 redis = { version = "0.27", features = ["tokio-comp"] }
 deadpool-redis = "0.18"
+# XML root-element parsing for OGC GetCapabilities checks (task 2.3)
+quick-xml = "0.37"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = "0.7.19"
