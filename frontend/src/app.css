@@ -1,20 +1,51 @@
 @import 'tailwindcss';
 
+/* Class-based dark mode (task 3.2): the `.dark` class is toggled on <html>
+   by the pre-paint script in app.html / the theme store. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Themeable color tokens. `@theme inline` makes utilities like `bg-surface`
+   resolve to the runtime CSS variables, so switching `.dark` re-themes
+   everything without recompiling. */
+@theme inline {
+    --color-surface: var(--surface);
+    --color-surface-2: var(--surface-2);
+    --color-line: var(--line);
+    --color-text: var(--text);
+    --color-muted: var(--muted);
+}
+
+:root {
+    --surface: #ffffff;
+    --surface-2: #f1f5f9;
+    --line: #e2e8f0;
+    --text: #0f172a;
+    --muted: #64748b;
+}
+
+.dark {
+    --surface: #0f172a;
+    --surface-2: #1e293b;
+    --line: #334155;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+}
+
 @utility container {
-  margin-inline: auto;
-  padding-inline: 1rem;
-  @media (width >= theme(--breakpoint-sm)) {
-    padding-inline: 2rem;
-  }
-  @media (width >= theme(--breakpoint-lg)) {
-    padding-inline: 4rem;
-  }
-  @media (width >= theme(--breakpoint-xl)) {
-    padding-inline: 5rem;
-  }
-  @media (width >= theme(--breakpoint-2xl)) {
-    padding-inline: 6rem;
-  }
+    margin-inline: auto;
+    padding-inline: 1rem;
+    @media (width >= theme(--breakpoint-sm)) {
+        padding-inline: 2rem;
+    }
+    @media (width >= theme(--breakpoint-lg)) {
+        padding-inline: 4rem;
+    }
+    @media (width >= theme(--breakpoint-xl)) {
+        padding-inline: 5rem;
+    }
+    @media (width >= theme(--breakpoint-2xl)) {
+        padding-inline: 6rem;
+    }
 }
 
 /*
@@ -26,11 +57,11 @@
   color utility to any element that depends on these defaults.
 */
 @layer base {
-  *,
-  ::after,
-  ::before,
-  ::backdrop,
-  ::file-selector-button {
-    border-color: var(--color-gray-200, currentcolor);
-  }
+    *,
+    ::after,
+    ::before,
+    ::backdrop,
+    ::file-selector-button {
+        border-color: var(--color-gray-200, currentcolor);
+    }
 }
