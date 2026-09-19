@@ -9,6 +9,15 @@ pub struct Config {
     pub database_url: String,
     pub log_level: String,
     pub redis_url: String,
+    /// Scheduler poll interval in seconds (env `SCHEDULER_TICK_SECONDS`).
+    pub scheduler_tick_seconds: u64,
+    /// Default probe timeout in ms (env `PROBE_TIMEOUT_MS_DEFAULT`).
+    pub probe_timeout_ms_default: i64,
+    /// Number of parallel probe workers (env `WORKER_CONCURRENCY`).
+    pub worker_concurrency: usize,
+    /// Consecutive failing probes before an alert is raised
+    /// (env `PROBE_FAILURE_THRESHOLD`, min 1).
+    pub probe_failure_threshold: u32,
 }
 
 impl Config {
@@ -35,10 +44,36 @@ impl Config {
                 .unwrap_or_else(|_| "info,tower_http=debug".to_string()),
             redis_url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:637".to_string()),
+            scheduler_tick_seconds: std::env::var("SCHEDULER_TICK_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            probe_timeout_ms_default: std::env::var("PROBE_TIMEOUT_MS_DEFAULT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
+            worker_concurrency: std::env::var("WORKER_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+            probe_failure_threshold: std::env::var("PROBE_FAILURE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
         }
     }
 
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// How often the scheduler polls for due targets.
+    pub fn scheduler_tick(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.scheduler_tick_seconds.max(1))
+    }
+
+    /// Default probe timeout (ms) when a target configuration lacks one.
+    pub fn probe_timeout_default(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.probe_timeout_ms_default.max(1_000) as u64)
     }
 }
