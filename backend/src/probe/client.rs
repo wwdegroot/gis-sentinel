@@ -9,7 +9,9 @@
 use axum::http::HeaderMap;
 use reqwest::Method;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::queue::{AuthSpec, ProbeJob};
 
 /// Maximum characters captured from the response body for diagnostics.
 const SNIPPET_MAX_CHARS: usize = 2000;
@@ -46,12 +48,16 @@ pub async fn run_http_probe(
     method: Method,
     headers: &HeaderMap,
     timeout: Duration,
+    auth: Option<&AuthSpec>,
 ) -> ProbeObservation {
     let started = Instant::now();
 
     let mut request = client.request(method, url).timeout(timeout);
     for (name, value) in headers.iter() {
         request = request.header(name, value);
+    }
+    if let Some(auth) = auth {
+        request = apply_auth(request, auth);
     }
 
     let response = match request.send().await {
@@ -121,6 +127,75 @@ pub fn build_probe_client() -> reqwest::Client {
         .expect("static reqwest client configuration is valid")
 }
 
+/// Execute a full probe for a [`ProbeJob`] (task 2.3 worker path).
+///
+/// Applies the GIS-specific URL transformation (see [`super::gis`]), the
+/// configured HTTP method, custom headers, auth, and per-job timeout, then
+/// runs the transport probe. Service-level checking of the returned body is
+/// a separate step ([`super::gis::check_service_response`]) so the caller
+/// controls evaluation.
+pub async fn run_job_probe(client: &reqwest::Client, job: &ProbeJob) -> ProbeObservation {
+    let url = super::gis::build_probe_url(job);
+    let method = match job.http_method {
+        crate::db::models::HttpMethod::Get => Method::GET,
+        crate::db::models::HttpMethod::Post => Method::POST,
+    };
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in &job.custom_headers {
+        match (
+            axum::http::HeaderName::from_lowercase(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            (Ok(n), Ok(v)) => {
+                headers.insert(n, v);
+            }
+            _ => {
+                warn!(target_id = %job.target_id, header = %name, "skipping invalid custom header")
+            }
+        }
+    }
+
+    let observation = run_http_probe(
+        client,
+        &url,
+        method,
+        &headers,
+        Duration::from_millis(job.timeout_ms.max(1) as u64),
+        job.auth.as_ref(),
+    )
+    .await;
+
+    if job.auth.is_some() {
+        debug!(target_id = %job.target_id, "probe sent with configured auth");
+    }
+
+    observation
+}
+
+/// Convert the REST API's `auth_config` JSONB into an [`AuthSpec`] for the
+/// job payload. Returns `None` for absent or malformed configs (malformation
+/// is logged by the scheduler; the API validates shapes upstream).
+pub fn parse_auth_spec(auth_config: Option<&serde_json::Value>) -> Option<AuthSpec> {
+    auth_config.and_then(|v| match serde_json::from_value::<AuthSpec>(v.clone()) {
+        Ok(spec) => Some(spec),
+        Err(e) => {
+            warn!(error = %e, "failed to parse auth_config; probing without auth");
+            None
+        }
+    })
+}
+
+/// Apply an [`AuthSpec`] to a request builder (helper for tests and the
+/// on-demand endpoint; [`run_http_probe`] currently applies headers only).
+pub fn apply_auth(builder: reqwest::RequestBuilder, auth: &AuthSpec) -> reqwest::RequestBuilder {
+    match auth {
+        AuthSpec::Basic { username, password } => builder.basic_auth(username, Some(password)),
+        AuthSpec::Bearer { token } => builder.bearer_auth(token),
+        AuthSpec::Header { name, value } => builder.header(name, value),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +210,7 @@ mod tests {
             Method::GET,
             &HeaderMap::new(),
             Duration::from_secs(2),
+            None,
         )
         .await;
         assert!(!obs.is_up);

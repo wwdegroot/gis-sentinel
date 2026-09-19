@@ -1,9 +1,10 @@
 //! GIS probe engine (task 2.3).
 //!
-//! Phase 2.1 ships only the HTTP transport layer ([`client`]) so the
-//! `POST /api/v1/alert-points/:id/test` endpoint can run on-demand probes.
-//! Service-type-specific checks (GetCapabilities parsing for WMS/WFS/WMTS,
-//! `f=pjson` for ArcGIS REST, OAF landing page) and alert state evaluation
-//! are added in task 2.3 as `gis.rs` / `evaluate.rs`.
+//! [`client`] is the HTTP transport (introduced in task 2.1 for the on-demand
+//! `/test` endpoint), [`gis`] adds service-type-specific checks
+//! (GetCapabilities for WMS/WFS/WMTS, `f=pjson` for ArcGIS REST, OAF landing
+//! page), and [`evaluate`] implements the per-target alert state machine.
 
 pub mod client;
+pub mod evaluate;
+pub mod gis;
