@@ -2,8 +2,9 @@
 //! at by `REDIS_URL` and is run explicitly:
 //! `cargo test -- --ignored queue_smoke`
 
-use backend::db::models::ServiceType;
+use backend::db::models::{HttpMethod, ServiceType};
 use backend::queue::{self, ProbeJob};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -22,10 +23,14 @@ async fn queue_round_trip() {
 
     let job = ProbeJob {
         target_id: Uuid::now_v7(),
+        target_name: "smoke-test".to_string(),
         url: "https://example.com/wms?SERVICE=WMS&REQUEST=GetCapabilities".to_string(),
         service_type: ServiceType::Wms,
         expected_time_ms: 500,
         timeout_ms: 2000,
+        http_method: HttpMethod::Get,
+        custom_headers: HashMap::from([("X-Api-Key".to_string(), "k".to_string())]),
+        auth: None,
     };
     queue::enqueue_probe_job(&pool, &job).await.unwrap();
     assert_eq!(queue::queue_len(&pool).await.unwrap(), 1);
