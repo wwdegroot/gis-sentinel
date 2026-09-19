@@ -1,5 +1,6 @@
 use crate::db::models::{AlertPoint, ServiceType};
 use crate::db::models::{NewAlertPoint, UpdateAlertPoint};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 /// Insert a new alert point. The client-side generated UUID v7 is stored as-is.
@@ -32,7 +33,8 @@ pub async fn create(pool: &PgPool, new: NewAlertPoint) -> Result<AlertPoint, sql
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         "#,
         id,
         new.name,
@@ -75,7 +77,8 @@ pub async fn list(
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         FROM alert_points
         WHERE ((NOT $1::bool) OR enabled)
           AND ($2::text IS NULL OR service_type = $2::text)
@@ -128,7 +131,8 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<AlertPoint, sqlx::Error> {
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         FROM alert_points
         WHERE id = $1
         "#,
@@ -175,7 +179,8 @@ pub async fn update(
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         "#,
         id,
         input.name,
@@ -199,4 +204,54 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// All enabled alert points whose check interval has elapsed (scheduler
+/// producer query, task 2.2). A point is due when it has never been checked
+/// or `last_checked_at + check_interval_seconds <= now()`.
+pub async fn list_due(pool: &PgPool) -> Result<Vec<AlertPoint>, sqlx::Error> {
+    sqlx::query_as!(
+        AlertPoint,
+        r#"
+        SELECT
+            id,
+            name,
+            url,
+            service_type AS "service_type: ServiceType",
+            check_interval_seconds,
+            expected_response_time_ms,
+            http_method AS "http_method: _",
+            custom_headers,
+            auth_config,
+            enabled,
+            created_at,
+            updated_at,
+            last_checked_at
+        FROM alert_points
+        WHERE enabled
+          AND (
+                last_checked_at IS NULL
+                OR last_checked_at + make_interval(secs => check_interval_seconds) <= now()
+              )
+        ORDER BY created_at, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Mark an alert point as just enqueued for probing (scheduler bookkeeping).
+/// Returns the recorded timestamp.
+pub async fn touch_last_checked(pool: &PgPool, id: Uuid) -> Result<DateTime<Utc>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        UPDATE alert_points
+        SET last_checked_at = now()
+        WHERE id = $1
+        RETURNING last_checked_at AS "last_checked_at!"
+        "#,
+        id,
+    )
+    .fetch_one(pool)
+    .await
 }
