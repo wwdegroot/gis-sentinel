@@ -18,16 +18,18 @@
 
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db::models::{AlertPoint, ServiceType};
+use crate::db::models::{ActiveAlert, AlertPoint, AlertType, ServiceType};
 use crate::db::repo;
 use crate::handlers::error::{ApiError, ApiResult};
 use crate::probe::client::{build_probe_client, run_http_probe};
+use crate::ws_protocol::AlertEvent;
 use crate::AppState;
 
 /// Route parameters bounds.
@@ -64,6 +66,9 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/update", post(update_alert_point))
         .route("/{id}/delete", post(delete_alert_point))
         .route("/{id}/test", post(test_alert_point))
+        .route("/{id}/history", get(get_history))
+        .route("/{id}/incidents", get(get_incidents))
+        .route("/{id}/history/export", get(export_history))
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +208,10 @@ async fn update_alert_point(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(payload): Json<UpdateAlertPointPayload>,
 ) -> ApiResult<Json<AlertPoint>> {
+    // Previous state is needed to detect an enable → disable transition
+    // (which must resolve the point's open alert — see below).
+    let point_before = repo::alert_points::get(&app.db, id).await?;
+
     // Reject no-op payloads instead of silently doing nothing.
     let touched_any = payload.name.is_some()
         || payload.url.is_some()
@@ -257,6 +266,21 @@ async fn update_alert_point(
     .await?;
 
     tracing::info!(id = %id, "alert point updated");
+
+    // Disabling a point stops the scheduler from enqueueing it, so its open
+    // alert would otherwise never be resolved and the incident would stick
+    // around forever. Resolve it and push a `Remove` event so connected
+    // dashboards drop the card immediately. The evaluator's streak state is
+    // reset too, otherwise re-enabling later would leave the state machine
+    // believing the alert is still open and never raise a fresh one.
+    if point_before.enabled && !point.enabled {
+        app.evaluator.lock().await.reset(point.id);
+        // Read the open alert before resolving so the event can carry its
+        // id/triggered_at.
+        let open = fetch_open_alert(&app, point.id).await;
+        resolve_and_broadcast(&app, &point, open, "service point disabled".to_string()).await;
+    }
+
     Ok(Json(point))
 }
 
@@ -264,12 +288,89 @@ async fn delete_alert_point(
     State(app): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> ApiResult<axum::http::StatusCode> {
+    // Metadata is captured before the delete because the point row (and its
+    // cascaded alerts) is gone afterwards — the `Remove` event needs it.
+    let point = repo::alert_points::get(&app.db, id).await?;
+    // The open alert must be read *before* the delete: the cascade removes
+    // the row, so there would be nothing left to look up afterwards.
+    let open = fetch_open_alert(&app, id).await;
+
     let deleted = repo::alert_points::delete(&app.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("alert point"));
     }
+    // `ON DELETE CASCADE` already removed the open alert row; broadcast so
+    // connected clients drop the incident card without waiting for a
+    // reconnect + snapshot. The evaluator streak is dropped as well so stale
+    // state cannot outlive the point.
+    app.evaluator.lock().await.reset(point.id);
+    resolve_and_broadcast(&app, &point, open, "service point deleted".to_string()).await;
+
     tracing::info!(id = %id, "alert point deleted");
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Alert teardown on disable / delete
+// ---------------------------------------------------------------------------
+
+/// Resolve a point's open alert (if any) and broadcast a `Remove` event so
+/// WebSocket clients immediately drop the incident. Used when a service point
+/// is disabled or deleted; the probe worker cannot do this because the
+/// scheduler simply stops scheduling the target. `open` must be read by the
+/// caller *before* any DB mutation that could cascade the alert away.
+async fn resolve_and_broadcast(
+    app: &AppState,
+    point: &AlertPoint,
+    open: Option<ActiveAlert>,
+    reason: String,
+) {
+    let Some(alert) = open else {
+        // Nothing open — nothing to resolve or broadcast.
+        return;
+    };
+
+    if let Err(e) = repo::active_alerts::resolve(&app.db, point.id).await {
+        tracing::error!(target_id = %point.id, error = %e, "failed to resolve open alert");
+        return;
+    }
+
+    let event = AlertEvent {
+        alert_id: alert.id,
+        alert_point_id: point.id,
+        alert_type: AlertType::Remove,
+        name: point.name.clone(),
+        url: point.url.clone(),
+        service_type: point.service_type,
+        status: alert.status,
+        reason,
+        response_time_ms: None,
+        expected_response_time_ms: point.expected_response_time_ms,
+        triggered_at: alert.triggered_at,
+    };
+    match serde_json::to_string(&crate::ws_protocol::WsMessage::Alert(event)) {
+        Ok(json) => {
+            tracing::info!(target_id = %point.id, alert_id = alert.id, "remove event broadcast");
+            let _ = app
+                .broadcast_tx
+                .send(axum::extract::ws::Message::Text(json.into()));
+        }
+        Err(e) => {
+            tracing::error!(target_id = %point.id, error = %e, "failed to serialize remove event")
+        }
+    }
+}
+
+/// Best-effort read of a point's open alert; errors are logged and treated as
+/// "none" so teardown (disable/delete) never fails because of the lookup.
+async fn fetch_open_alert(app: &AppState, point_id: Uuid) -> Option<ActiveAlert> {
+    match repo::active_alerts::latest_open(&app.db, point_id).await {
+        Ok(open) => open,
+        Err(e) => {
+            tracing::error!(target_id = %point_id, error = %e, "failed to read open alert");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +408,193 @@ fn configured_headers_to_map(custom_headers: &Value) -> Result<HeaderMap, ApiErr
     Ok(map)
 }
 
+// ---------------------------------------------------------------------------
+// Probe history
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct HistoryParams {
+    /// Window in hours; clamped to [1, 720] (30 days).
+    hours: Option<i32>,
+}
+
+/// GET /{id}/history — uptime percentage + capped probe series for a window.
+async fn get_history(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<HistoryParams>,
+) -> ApiResult<Json<repo::probe_results::ProbeHistory>> {
+    // 404 when the point does not exist (also validates the id).
+    repo::alert_points::get(&app.db, id).await?;
+
+    let hours = params.hours.unwrap_or(24).clamp(1, 720);
+    let probes =
+        repo::probe_results::list_since(&app.db, id, hours, repo::probe_results::HISTORY_ROW_CAP)
+            .await?;
+    let uptime_pct = repo::probe_results::uptime_percentage(&app.db, id, hours).await?;
+
+    Ok(Json(repo::probe_results::ProbeHistory {
+        hours,
+        uptime_pct,
+        probes,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Incidents (failed probes, history-page table)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct IncidentsParams {
+    /// Window in hours; clamped to [1, 720] (30 days).
+    hours: Option<i32>,
+}
+
+/// GET /{id}/incidents — failed probes with error detail for the history-page
+/// incident table. Deliberately separate from the slim graph history response
+/// (which omits `status_code`/`error_message`) and from the export endpoint
+/// (which is for file downloads only).
+async fn get_incidents(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<IncidentsParams>,
+) -> ApiResult<Json<Vec<repo::probe_results::ProbeIncident>>> {
+    // 404 when the point does not exist (also validates the id).
+    repo::alert_points::get(&app.db, id).await?;
+
+    let hours = params.hours.unwrap_or(24).clamp(1, 720);
+    let incidents = repo::probe_results::list_failed_since(
+        &app.db,
+        id,
+        hours,
+        repo::probe_results::HISTORY_ROW_CAP,
+    )
+    .await?;
+    Ok(Json(incidents))
+}
+
+// ---------------------------------------------------------------------------
+// Export (CSV / JSON downloads)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExportFormat {
+    Csv,
+    Json,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportParams {
+    /// `csv` (default) or `json`.
+    format: Option<ExportFormat>,
+    /// Window in hours; clamped to [1, 720] (30 days).
+    hours: Option<i32>,
+}
+
+/// GET /{id}/history/export — download the failed probes of the window as
+/// CSV or JSON. Download-only endpoint; views use `/{id}/incidents` instead.
+async fn export_history(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<ExportParams>,
+) -> ApiResult<Response> {
+    let point = repo::alert_points::get(&app.db, id).await?;
+
+    let hours = params.hours.unwrap_or(24).clamp(1, 720);
+    let incidents = repo::probe_results::list_failed_since(
+        &app.db,
+        id,
+        hours,
+        repo::probe_results::HISTORY_ROW_CAP,
+    )
+    .await?;
+
+    let slug = slugify(&point.name);
+    let (content_type, body, ext) = match params.format.unwrap_or(ExportFormat::Csv) {
+        ExportFormat::Csv => (
+            "text/csv; charset=utf-8",
+            incidents_to_csv(&incidents),
+            "csv",
+        ),
+        ExportFormat::Json => (
+            "application/json",
+            serde_json::to_string_pretty(&incidents).map_err(|e| {
+                ApiError::Internal(anyhow::anyhow!(e).context("failed to serialize export"))
+            })?,
+            "json",
+        ),
+    };
+
+    let disposition = format!("attachment; filename=\"{slug}-incidents.{ext}\"");
+    let mut response = (axum::http::StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(content_type),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&disposition).map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!(e).context("invalid content-disposition header"))
+        })?,
+    );
+    Ok(response)
+}
+
+/// Serialize incidents as CSV: header row + one row per incident, RFC 4180
+/// quoting (fields wrapped in double quotes, embedded quotes doubled).
+fn incidents_to_csv(incidents: &[repo::probe_results::ProbeIncident]) -> String {
+    let mut out = String::from("timestamp,response_time_ms,status_code,is_up,error_message\n");
+    for i in incidents {
+        out.push_str(&csv_field(&i.timestamp.to_rfc3339()));
+        out.push(',');
+        out.push_str(&csv_field(
+            &i.response_time_ms
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        ));
+        out.push(',');
+        out.push_str(&csv_field(
+            &i.status_code.map(|v| v.to_string()).unwrap_or_default(),
+        ));
+        out.push(',');
+        out.push_str(&csv_field(if i.is_up { "true" } else { "false" }));
+        out.push(',');
+        out.push_str(&csv_field(i.error_message.as_deref().unwrap_or("")));
+        out.push('\n');
+    }
+    out
+}
+
+/// Quote one CSV field per RFC 4180.
+fn csv_field(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Filesystem-safe slug for export filenames (fallback `export`).
+fn slugify(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let collapsed = slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "export".to_string()
+    } else {
+        collapsed
+    }
+}
+
 async fn test_alert_point(
     State(app): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -327,6 +615,7 @@ async fn test_alert_point(
         method,
         &headers,
         probe_timeout(point.expected_response_time_ms),
+        None, // basic auth already folded into `url` by apply_basic_auth
     )
     .await;
 
@@ -536,6 +825,21 @@ fn validate_auth_config_inner(auth: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_field_quotes_and_escapes() {
+        assert_eq!(csv_field("plain"), "\"plain\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field(""), "\"\"");
+    }
+
+    #[test]
+    fn slugify_produces_safe_filenames() {
+        assert_eq!(slugify("My WMS Service"), "my-wms-service");
+        assert_eq!(slugify("odd//name!!"), "odd-name");
+        assert_eq!(slugify("###"), "export");
+        assert_eq!(slugify(""), "export");
+    }
 
     #[test]
     fn url_validation_accepts_http_and_https() {
