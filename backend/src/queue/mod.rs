@@ -8,9 +8,10 @@
 //! Connection pooling uses `deadpool-redis`; a `Pool` hands out connections
 //! on demand and transparently re-creates broken ones.
 
-use crate::db::models::ServiceType;
+use crate::db::models::{HttpMethod, ServiceType};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
@@ -20,6 +21,11 @@ pub const PROBE_QUEUE_KEY: &str = "sentinel:probe_jobs";
 
 /// Redis Pub/Sub channel for alert lifecycle events (`New`/`Update`/`Remove`).
 pub const ALERTS_PUBSUB_CHANNEL: &str = "sentinel:alerts";
+
+/// Key prefix for the per-target in-flight gate (task 2.2): a `SET NX EX` on
+/// `sentinel:inflight:{target_id}` ensures a target has at most one pending
+/// or in-flight probe job.
+pub const INFLIGHT_KEY_PREFIX: &str = "sentinel:inflight:";
 
 /// Default maximum number of pooled connections.
 const POOL_MAX_SIZE: usize = 10;
@@ -68,11 +74,16 @@ impl From<serde_json::Error> for QueueError {
 /// A single probe job as serialized onto the queue.
 ///
 /// This is the wire contract between the scheduler (producer, task 2.2) and
-/// the worker (consumer, task 2.3); keep field names stable.
+/// the worker (consumer, task 2.3); keep field names stable. All task-2.3
+/// additions have `#[serde(default)]` so jobs enqueued by an older scheduler
+/// remain deserializable while the queue drains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeJob {
     /// `alert_points.id` of the monitoring target this job belongs to.
     pub target_id: Uuid,
+    /// Display name of the target (for alert events; saves the worker a DB read).
+    #[serde(default)]
+    pub target_name: String,
     /// Endpoint URL to probe.
     pub url: String,
     /// GIS service type, drives probe strategy in the worker.
@@ -81,6 +92,36 @@ pub struct ProbeJob {
     pub expected_time_ms: i32,
     /// Probe request timeout in milliseconds.
     pub timeout_ms: i32,
+    /// HTTP method for the probe request (default GET).
+    #[serde(default)]
+    pub http_method: HttpMethod,
+    /// Custom request headers (validated upstream by the REST API).
+    #[serde(default)]
+    pub custom_headers: HashMap<String, String>,
+    /// Authentication to apply to the probe request, if any.
+    #[serde(default)]
+    pub auth: Option<AuthSpec>,
+}
+
+/// Authentication attached to a probe job.
+///
+/// Tagged JSON matching the `auth_config` shapes validated by the REST API:
+/// `{"type":"basic","username":..,"password":..}` etc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthSpec {
+    Basic {
+        username: String,
+        #[serde(default)]
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
+    Header {
+        name: String,
+        value: String,
+    },
 }
 
 /// Create a pooled Valkey/Redis connection pool.
@@ -139,5 +180,38 @@ pub async fn queue_len(pool: &RedisPool) -> Result<u64, QueueError> {
 pub async fn clear_queue(pool: &RedisPool) -> Result<(), QueueError> {
     let mut conn = pool.get().await?;
     conn.del::<_, ()>(PROBE_QUEUE_KEY).await?;
+    Ok(())
+}
+
+/// Try to acquire the in-flight gate for `target_id`.
+///
+/// Returns `true` if this caller won the gate and may enqueue a probe job;
+/// `false` when a job for this target is already pending or in flight. The
+/// key expires after `ttl_secs` as a safety net — the worker also releases
+/// it explicitly when the probe finishes (task 2.3).
+pub async fn try_acquire_inflight(
+    pool: &RedisPool,
+    target_id: Uuid,
+    ttl_secs: u64,
+) -> Result<bool, QueueError> {
+    let key = format!("{INFLIGHT_KEY_PREFIX}{target_id}");
+    let mut conn = pool.get().await?;
+    let set: Option<String> = redis::cmd("SET")
+        .arg(&key)
+        .arg(1)
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async(&mut conn)
+        .await?;
+    Ok(set.is_some())
+}
+
+/// Release the in-flight gate for `target_id` (called by the worker when the
+/// probe completes, task 2.3).
+pub async fn release_inflight(pool: &RedisPool, target_id: Uuid) -> Result<(), QueueError> {
+    let key = format!("{INFLIGHT_KEY_PREFIX}{target_id}");
+    let mut conn = pool.get().await?;
+    conn.del::<_, ()>(key).await?;
     Ok(())
 }
