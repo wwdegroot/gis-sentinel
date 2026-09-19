@@ -42,6 +42,18 @@ pub enum AlertType {
     Remove,
 }
 
+/// Evaluated health status of a monitoring target.
+/// Stored in PostgreSQL as `HEALTHY`/`DEGRADED`/`DOWN` (migration 0003);
+/// serialized to clients as `healthy`/`degraded`/`down`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "UPPERCASE")]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatus {
+    Healthy,
+    Degraded,
+    Down,
+}
+
 /// A configured monitoring target.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AlertPoint {
@@ -57,6 +69,9 @@ pub struct AlertPoint {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When this target was last enqueued for probing (scheduler bookkeeping,
+    /// task 2.2). `NULL` = never probed.
+    pub last_checked_at: Option<DateTime<Utc>>,
 }
 
 /// Payload for creating a new `AlertPoint`.
@@ -126,6 +141,7 @@ pub struct ActiveAlert {
     pub id: i64,
     pub alert_point_id: Uuid,
     pub alert_type: AlertType,
+    pub status: ServiceStatus,
     pub reason: String,
     pub triggered_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
@@ -136,5 +152,24 @@ pub struct ActiveAlert {
 pub struct NewActiveAlert {
     pub alert_point_id: Uuid,
     pub alert_type: AlertType,
+    pub status: ServiceStatus,
     pub reason: String,
+}
+
+/// An open alert joined with its monitoring target's metadata — the shape
+/// WebSocket snapshot-on-connect is built from (task 2.4).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct OpenAlertWithPoint {
+    // active_alerts columns
+    pub id: i64,
+    pub alert_point_id: Uuid,
+    pub alert_type: AlertType,
+    pub status: ServiceStatus,
+    pub reason: String,
+    pub triggered_at: DateTime<Utc>,
+    // joined alert_points columns
+    pub name: String,
+    pub url: String,
+    pub service_type: ServiceType,
+    pub expected_response_time_ms: i32,
 }
