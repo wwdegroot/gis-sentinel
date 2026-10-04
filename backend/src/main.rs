@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod handlers;
 pub mod probe;
@@ -6,7 +7,7 @@ pub mod ws_protocol;
 
 use crate::config::Config;
 use crate::handlers::{
-    alert_points_api, generic::static_handler, sentinel_ws::ws_sentinel_handler,
+    alert_points_api, auth_api, generic::static_handler, sentinel_ws::ws_sentinel_handler,
 };
 use backend::db;
 use backend::queue;
@@ -69,6 +70,28 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|e| panic!("database migrations failed: {e}"));
     tracing::info!("database connected and migrations up to date");
 
+    // Bootstrap admin (Q5): if BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD are
+    // set, upsert the admin row idempotently on every boot (rotating the env
+    // value rotates the password). Without these, no local admin exists until
+    // one is provisioned (future CLI / Option D provisioning).
+    if let (Some(email), Some(password)) =
+        (&config.bootstrap_admin_email, &config.bootstrap_admin_password)
+    {
+        match auth::password::hash_password(password) {
+            Ok(hash) => match db::repo::users::upsert_bootstrap_admin(&db_pool, email, &hash).await {
+                Ok(u) => tracing::info!(
+                    user_id = u.id,
+                    email = %u.email,
+                    "bootstrap admin ready (session-cookie auth enabled)"
+                ),
+                Err(e) => tracing::error!(error = %e, "failed to upsert bootstrap admin"),
+            },
+            Err(e) => tracing::error!(error = %e, "failed to hash bootstrap admin password"),
+        }
+    } else {
+        tracing::info!("no BOOTSTRAP_ADMIN_* env set; session-cookie auth has no local admin");
+    }
+
     // Valkey/Redis queue connection + health check.
     // Phase 1 keeps the server booting without a reachable Valkey — the queue
     // is not consumed yet; the scheduler/worker (Phase 2) will make it mandatory.
@@ -122,11 +145,18 @@ async fn main() -> Result<()> {
         )
     };
 
-    // Build the application router
+    // Build the application router.
+    //
+    // Auth (Option B): auth is enforced per-handler via the `CurrentUser`
+    // extractor (401 when absent) — the alert-points handlers, `/auth/me`, and
+    // the WS upgrade all declare it. `/auth/{login,logout}` are public. The SPA
+    // fallback stays public — the bundle has no secrets, and the frontend gates
+    // itself via `/auth/me` (401 → redirect to /login).
     let app = Router::new()
         .fallback(static_handler)
         .route("/ws/sentinel", get(ws_sentinel_handler))
         .nest("/api/v1/alert-points", alert_points_api::router())
+        .nest("/api/v1/auth", auth_api::router())
         .with_state(app_state.clone())
         .layer(
             tower::ServiceBuilder::new()
