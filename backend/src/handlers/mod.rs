@@ -1,4 +1,5 @@
 pub mod alert_points_api;
+pub mod auth_api;
 pub mod error;
 pub mod generic;
 pub mod sentinel_ws;
