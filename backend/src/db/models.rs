@@ -54,6 +54,47 @@ pub enum ServiceStatus {
     Down,
 }
 
+/// User role (migration 0004). Stored as `admin`/`viewer`; serialized to clients
+/// as `admin`/`viewer`. `viewer` is read-only on the API (GET routes only);
+/// `admin` may also use POST sub-actions (create/update/delete/test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Admin,
+    Viewer,
+}
+
+impl Role {
+    /// True when `self` satisfies a route requiring `required`.
+    /// `admin` satisfies both; `viewer` satisfies only `viewer`.
+    pub fn at_least(self, required: Role) -> bool {
+        match (self, required) {
+            (Role::Admin, _) => true,
+            (Role::Viewer, Role::Viewer) => true,
+            (Role::Viewer, Role::Admin) => false,
+        }
+    }
+}
+
+/// A local user account (session-cookie auth, Option B).
+///
+/// `password_hash` holds an argon2 PHC string; never serialize it to clients.
+/// The reverse-proxy/SSO path (Option D) reuses this table by upserting rows
+/// keyed on `email` from a trusted `X-Authenticated-User` header.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct User {
+    pub id: i64,
+    pub email: String,
+    /// argon2 PHC string — never sent to clients (excluded from API responses
+    /// via the `UserPublic` projection in `handlers::auth_api`).
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    pub role: Role,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A configured monitoring target.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AlertPoint {
@@ -172,4 +213,25 @@ pub struct OpenAlertWithPoint {
     pub url: String,
     pub service_type: ServiceType,
     pub expected_response_time_ms: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_at_least() {
+        assert!(Role::Admin.at_least(Role::Admin));
+        assert!(Role::Admin.at_least(Role::Viewer));
+        assert!(Role::Viewer.at_least(Role::Viewer));
+        assert!(!Role::Viewer.at_least(Role::Admin));
+    }
+
+    #[test]
+    fn role_serde_is_lowercase() {
+        assert_eq!(serde_json::to_string(&Role::Admin).unwrap(), "\"admin\"");
+        assert_eq!(serde_json::to_string(&Role::Viewer).unwrap(), "\"viewer\"");
+        let r: Role = serde_json::from_str("\"viewer\"").unwrap();
+        assert_eq!(r, Role::Viewer);
+    }
 }
