@@ -19,6 +19,12 @@ pub enum ApiError {
     /// Malformed request (e.g. `UpdateAlertPoint` with no fields set).
     #[error("{0}")]
     BadRequest(String),
+    /// Authentication required / failed (no session or bad credentials).
+    #[error("{0}")]
+    Unauthorized(String),
+    /// Authenticated but lacking the required role.
+    #[error("{0}")]
+    Forbidden(String),
     /// Payload failed validation; carries (field, message) pairs.
     #[error("validation failed")]
     Validation(Vec<(String, String)>),
@@ -72,6 +78,12 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, "bad_request", msg.clone(), None)
             }
+            ApiError::Unauthorized(msg) => {
+                (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone(), None)
+            }
+            ApiError::Forbidden(msg) => {
+                (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None)
+            }
             ApiError::Validation(fields) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",
@@ -109,6 +121,15 @@ impl IntoResponse for ApiError {
 /// Convenience alias for handler return types.
 pub type ApiResult<T> = Result<T, ApiError>;
 
+impl ApiError {
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        ApiError::Unauthorized(msg.into())
+    }
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        ApiError::Forbidden(msg.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +138,13 @@ mod tests {
     fn row_not_found_maps_to_not_found() {
         let err: ApiError = sqlx::Error::RowNotFound.into();
         assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn unauthorized_and_forbidden_status_codes() {
+        let r = ApiError::unauthorized("no").into_response();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let r = ApiError::forbidden("no").into_response();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }
