@@ -18,6 +18,26 @@ pub struct Config {
     /// Consecutive failing probes before an alert is raised
     /// (env `PROBE_FAILURE_THRESHOLD`, min 1).
     pub probe_failure_threshold: u32,
+    // ---- Auth (Option B/D) ----
+    /// Session cookie name (env `SESSION_COOKIE_NAME`).
+    pub session_cookie_name: String,
+    /// Session lifetime in seconds, Redis TTL + cookie Max-Age (env `SESSION_TTL_SECONDS`).
+    pub session_ttl_secs: u64,
+    /// Cookie `Secure` flag (env `COOKIE_SECURE`; keep `true` in prod over HTTPS).
+    pub cookie_secure: bool,
+    /// Cookie `SameSite` policy: `strict` | `lax` | `none` (env `COOKIE_SAMESITE`).
+    pub cookie_samesite: String,
+    /// Optional cookie `Domain` (env `COOKIE_DOMAIN`).
+    pub cookie_domain: Option<String>,
+    /// Startup upsert of the first admin — email (env `BOOTSTRAP_ADMIN_EMAIL`).
+    pub bootstrap_admin_email: Option<String>,
+    /// Startup upsert of the first admin — password (env `BOOTSTRAP_ADMIN_PASSWORD`).
+    pub bootstrap_admin_password: Option<String>,
+    /// Enable reverse-proxy trusted-header auth / Option D (env `ENABLE_TRUSTED_PROXY_AUTH`).
+    pub enable_trusted_proxy_auth: bool,
+    /// IP address of the trusted proxy; `X-Authenticated-User` is honored only
+    /// from this peer (env `TRUSTED_PROXY_IP`).
+    pub trusted_proxy_ip: Option<String>,
 }
 
 impl Config {
@@ -60,6 +80,27 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2),
+            // ---- Auth (Option B/D) ----
+            session_cookie_name: std::env::var("SESSION_COOKIE_NAME")
+                .unwrap_or_else(|_| "sentinel_session".to_string()),
+            session_ttl_secs: std::env::var("SESSION_TTL_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60 * 60 * 24 * 7),
+            cookie_secure: std::env::var("COOKIE_SECURE")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+            cookie_samesite: std::env::var("COOKIE_SAMESITE")
+                .unwrap_or_else(|_| "strict".to_string()),
+            cookie_domain: std::env::var("COOKIE_DOMAIN").ok(),
+            bootstrap_admin_email: std::env::var("BOOTSTRAP_ADMIN_EMAIL").ok(),
+            bootstrap_admin_password: std::env::var("BOOTSTRAP_ADMIN_PASSWORD").ok(),
+            enable_trusted_proxy_auth: std::env::var("ENABLE_TRUSTED_PROXY_AUTH")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            trusted_proxy_ip: std::env::var("TRUSTED_PROXY_IP").ok(),
         }
     }
 
