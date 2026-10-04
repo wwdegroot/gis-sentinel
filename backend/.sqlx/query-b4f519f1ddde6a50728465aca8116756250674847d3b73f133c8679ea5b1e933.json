@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM alert_points WHERE name = 'smoke-test'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "b4f519f1ddde6a50728465aca8116756250674847d3b73f133c8679ea5b1e933"
+}
