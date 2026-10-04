@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, info};
 
+use crate::auth::CurrentUser;
 use crate::db::repo;
 use crate::ws_protocol::WsMessage;
 use crate::AppState;
@@ -20,6 +21,9 @@ pub async fn ws_sentinel_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     State(app): State<AppState>,
+    // Auth gate: the session cookie rides the WS upgrade (same-origin);
+    // extraction failure rejects the upgrade with a 401 before it starts.
+    user: CurrentUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
@@ -27,7 +31,7 @@ pub async fn ws_sentinel_handler(
     } else {
         String::from("Unknown browser")
     };
-    debug!("`{user_agent}` at {addr} connected.");
+    debug!("`{user_agent}` at {addr} connected (user {}).", user.email);
     ws.on_upgrade(move |socket| handle_sentinel_socket(socket, addr, State(app)))
 }
 
