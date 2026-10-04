@@ -28,6 +28,8 @@ use uuid::Uuid;
 use crate::db::models::{ActiveAlert, AlertPoint, AlertType, ServiceType};
 use crate::db::repo;
 use crate::handlers::error::{ApiError, ApiResult};
+use crate::auth::CurrentUser;
+use crate::db::models::Role;
 use crate::probe::client::{build_probe_client, run_http_probe};
 use crate::ws_protocol::AlertEvent;
 use crate::AppState;
@@ -53,6 +55,17 @@ const FORBIDDEN_HEADERS: &[&str] = &[
     "proxy-connection",
     "proxy-authorization",
 ];
+
+/// Reject non-admin users with 403. Called at the top of every write handler.
+/// (`require_auth` has already authenticated the caller and injected
+/// `Extension<CurrentUser>`; this enforces the admin/viewer split, Q3-b.)
+fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.role.at_least(Role::Admin) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("admin role required for this action"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -103,6 +116,7 @@ struct AlertPointListResponse {
 
 async fn list_alert_points(
     State(app): State<AppState>,
+    _user: CurrentUser,
     axum::extract::Query(params): axum::extract::Query<ListParams>,
 ) -> ApiResult<Json<AlertPointListResponse>> {
     let page = params.page.unwrap_or(1).max(1);
@@ -152,8 +166,10 @@ async fn list_alert_points(
 
 async fn create_alert_point(
     State(app): State<AppState>,
+    user: CurrentUser,
     Json(payload): Json<crate::db::models::NewAlertPoint>,
 ) -> ApiResult<(axum::http::StatusCode, Json<AlertPoint>)> {
+    require_admin(&user)?;
     validate_new_point(&payload)?;
 
     let point = repo::alert_points::create(&app.db, payload).await?;
@@ -189,6 +205,7 @@ struct AlertPointDetailResponse {
 
 async fn get_alert_point(
     State(app): State<AppState>,
+    _user: CurrentUser,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> ApiResult<Json<AlertPointDetailResponse>> {
     let point = repo::alert_points::get(&app.db, id).await?;
@@ -206,8 +223,10 @@ async fn get_alert_point(
 async fn update_alert_point(
     State(app): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    user: CurrentUser,
     Json(payload): Json<UpdateAlertPointPayload>,
 ) -> ApiResult<Json<AlertPoint>> {
+    require_admin(&user)?;
     // Previous state is needed to detect an enable → disable transition
     // (which must resolve the point's open alert — see below).
     let point_before = repo::alert_points::get(&app.db, id).await?;
@@ -287,7 +306,9 @@ async fn update_alert_point(
 async fn delete_alert_point(
     State(app): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    user: CurrentUser,
 ) -> ApiResult<axum::http::StatusCode> {
+    require_admin(&user)?;
     // Metadata is captured before the delete because the point row (and its
     // cascaded alerts) is gone afterwards — the `Remove` event needs it.
     let point = repo::alert_points::get(&app.db, id).await?;
@@ -421,6 +442,7 @@ struct HistoryParams {
 /// GET /{id}/history — uptime percentage + capped probe series for a window.
 async fn get_history(
     State(app): State<AppState>,
+    _user: CurrentUser,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<HistoryParams>,
 ) -> ApiResult<Json<repo::probe_results::ProbeHistory>> {
@@ -456,6 +478,7 @@ struct IncidentsParams {
 /// (which is for file downloads only).
 async fn get_incidents(
     State(app): State<AppState>,
+    _user: CurrentUser,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<IncidentsParams>,
 ) -> ApiResult<Json<Vec<repo::probe_results::ProbeIncident>>> {
@@ -496,6 +519,7 @@ struct ExportParams {
 /// CSV or JSON. Download-only endpoint; views use `/{id}/incidents` instead.
 async fn export_history(
     State(app): State<AppState>,
+    _user: CurrentUser,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<ExportParams>,
 ) -> ApiResult<Response> {
@@ -598,7 +622,9 @@ fn slugify(name: &str) -> String {
 async fn test_alert_point(
     State(app): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    user: CurrentUser,
 ) -> ApiResult<Json<crate::probe::client::ProbeObservation>> {
+    require_admin(&user)?;
     let point = repo::alert_points::get(&app.db, id).await?;
 
     let method = match point.http_method {
