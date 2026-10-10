@@ -1,5 +1,7 @@
 # User Admin Plan — manage users (admin-only CRUD UI + endpoints)
 
+**Status:** ✅ **IMPLEMENTED & VERIFIED** (2026-10-10) — tasks 2.7 + 3.7 complete; implementation report in §10. Remaining: the fake-based `tests/api_users.rs` integration harness (§10.6).
+
 **Goal:** let logged-in admins add/remove/edit users from a `/users` page.
 Viewers keep read-only access everywhere (auth-plan Q3-b); the user list itself is
 **admin-only** (viewers never see the page, the nav link, or the endpoints — 403).
@@ -194,3 +196,62 @@ explaining why (mirror the disabled reason pattern used for `/services` viewers)
    - edit user role admin→viewer → that user's live session is revoked (next `/auth/me` → 401 → `/login`);
    - delete self / last admin → server refuses with clear message;
    - normal viewer flows unaffected (`/services` still read-only for viewers).
+
+---
+
+## 10. Implementation report (2026-10-10)
+
+Everything below is implemented and verified against the live stack (shared
+PostgreSQL `postgres-gs` + Valkey `valkey-gs`), with
+`cargo build/clippy -D warnings/test` (offline `.sqlx`) and
+`svelte-check`/`oxlint` for the frontend.
+
+### 10.1 Backend — task 2.7
+
+| Piece | Where | Notes / deviations |
+| --- | --- | --- |
+| `list`, `delete`, `update_email`, `update_password`, `update_role`, `count_admins` | `backend/src/db/repo/users.rs` | All updates return the refreshed `User` (`Option` for idempotent-miss); `count_admins` = `SELECT COUNT(*)` scalar; `.sqlx` cache regenerated with `cargo sqlx prepare` (stale entries pruned, offline build green) |
+| Session index + revocation | `backend/src/auth/session.rs` | `create()` SADDs the token into `sentinel:session_idx:{user_id}` (TTL'd like the session); new `revoke_user_sessions(pool, user_id)` **and** `revoke_other_user_sessions(pool, user_id, keep_token)` — the latter keeps the current device signed in |
+| Router + handlers | `backend/src/handlers/users_api.rs` (NEW) | `GET /api/v1/users`, `POST /api/v1/users` → **201 `UserAccount`**, `POST /api/v1/users/{id}/update`, `POST /api/v1/users/{id}/delete` → **204**; local `require_admin` mirrors `alert_points_api.rs` |
+| Response shape | `UserAccount` | The list/table needs timestamps, so the user endpoints return `UserAccount` (`id`, `email`, `role`, `created_at`, `updated_at`) instead of re-using `UserPublic` (`/auth/me` keeps its original shape) |
+| Guards (Q3) | handler-level, unit-testable without Redis | Self-delete → 409; demote/delete **last admin** → 409; **self-demote → 409** ("cannot change your own role; ask another admin" — added after live testing showed a self-demote instantly revoked the caller's own session); password rotation optional (absent = unchanged, argon2 via `auth::password`) |
+| Session revocation | after **any** successful update/delete | Role/email are baked into the session payload, so stale sessions must not survive an edit; Redis failures are logged best-effort, never surfaced (mirrors the logout path) |
+| Error mapping | `handlers/error.rs` + `map_user_db_err` | New `ApiError::Conflict` variant → **409** (duplicate email, rule violations); validation → **422** `Validation(field, message)`; unknown id → **404** |
+| Wiring | `handlers/mod.rs`, `main.rs` | `/api/v1/users` nested under the auth router block |
+| **Beyond the plan (§7)** | `handlers/auth_api.rs` | `POST /api/v1/auth/change-password` — self-service credential change (Settings page): verifies the current password, re-hashes, signs out all *other* devices, keeps the current session alive (the hash is not part of the session payload) |
+
+### 10.2 Frontend — task 3.7
+
+| Piece | Where |
+| --- | --- |
+| Types | `src/lib/types.ts`: `UserAccount` (public user + timestamps), `NewUser { email, password, role }`, `UserPatch`, `ChangePasswordPayload` |
+| API fns | `src/lib/api.ts`: `listUsers()` / `createUser()` / `updateUser(id, patch)` / `deleteUser(id)` / `changePassword()` — same fetch/`ApiError`/401 style as the alert-point fns |
+| `/users` page (NEW) | `src/routes/users/+page.svelte` — admin-only (`auth.ready` + `auth.isAdmin` gate, redirect to `/` otherwise); page-local `$state` with optimistic list updates, mirroring `/services` (no separate store — `useUsers.svelte.ts` dropped as unnecessary) |
+| Components (NEW) | `src/lib/components/users/`: `UsersTable`, `UserCreateModal`, `UserEditModal` (email / role select / optional password reset), `UserDeleteConfirm` |
+| Gating UX | table disables **Delete** on yourself with a tooltip; edit modal disables the role select for your own account (server enforces 409 anyway) |
+| Nav | `routes/+layout.svelte`: **Users** link rendered only when `auth.isAdmin` (desktop + mobile rows) |
+| **Settings → Account** (NEW) | `routes/settings/+page.svelte`: "Change password" form (current + new + repeat, min 8 chars, must differ) → `POST /auth/change-password`; success note "your other sessions were signed out" |
+| Socket | `sentinelSocket.svelte.ts` unchanged — role/email changes revoke that user's sessions → global 401 handler → `/login` → reconnect after re-login |
+
+### 10.3 Tests & verification
+
+- `handlers::users_api::tests` — pure validation (email format/length, password
+  bounds, 422 field pairs) + `require_admin` guard (no Redis/DB).
+- `auth::session::tests` — two `#[ignore]` Redis round-trips (revocation of all
+  sessions; `revoke_other_user_sessions` keeps the current token). Both green
+  against live Valkey.
+- Live curl smoke against the running backend (all endpoints):
+  401 unauth → viewer 403 → admin 200 list → 201 create → 409 duplicate →
+  422 field errors → 409 self-delete / last-admin demote / self-demote →
+  role change revokes the victim's session (next `/auth/me` 401) → password
+  rotation (old pass 401, new 200) → email change revokes sessions →
+  change-password (wrong current 401, current session stays alive) → delete 204.
+- `cargo build --all-targets`, `clippy -D warnings`, `cargo test` (offline) green;
+  `svelte-check` 0 errors / 0 warnings; `oxlint src/` clean.
+
+### 10.4 Remaining
+
+- `tests/api_users.rs` — the fake-based integration harness (§6 cases 1–5). The
+  handlers live in the binary crate against `AppState` (live pools); driving
+  cookie-auth over in-memory fakes needs a session-store abstraction first, so
+  the live curl smoke (§10.3) is the interim source of truth.
