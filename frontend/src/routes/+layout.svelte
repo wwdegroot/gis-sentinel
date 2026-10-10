@@ -1,9 +1,11 @@
 <script lang="ts">
     import '../app.css';
     import { onMount } from 'svelte';
+    import { goto } from '$app/navigation';
     import { page } from '$app/state';
     import { sentinel } from '$lib/sentinelSocket.svelte';
     import { theme } from '$lib/theme.svelte';
+    import { auth } from '$lib/auth.svelte';
     import ConnectionBadge from '$lib/components/ConnectionBadge.svelte';
 
     let { children } = $props();
@@ -18,9 +20,29 @@
     const isActive = (href: string) =>
         href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href);
 
-    // App-wide socket (Q4-b): connect once in the layout so the connection
-    // badge is live on every page; the reconnect loop makes this safe.
-    onMount(() => sentinel.connect());
+    const onLoginPage = $derived(page.url.pathname.startsWith('/login'));
+
+    // Resolve the session cookie once on app load (auth plan §9): without a
+    // valid session every protected page would 401, so bounce to /login.
+    onMount(() => auth.init());
+
+    // Auth gate: any page other than /login requires a logged-in user.
+    $effect(() => {
+        if (auth.ready && !auth.currentUser && !onLoginPage) {
+            const next = page.url.pathname === '/' ? '' : `?redirect=${page.url.pathname}`;
+            goto(`/login${next}`);
+        }
+    });
+
+    // App-wide socket (Q4-b): the WS upgrade is cookie-authenticated, so it
+    // only runs while a session exists; `close()` stops the reconnect loop.
+    $effect(() => {
+        if (auth.currentUser) {
+            sentinel.connect();
+        } else if (auth.ready) {
+            sentinel.close();
+        }
+    });
 </script>
 
 <div class="min-h-screen bg-surface text-text">
@@ -48,6 +70,30 @@
                 </div>
             </div>
             <div class="flex items-center gap-3">
+                {#if auth.currentUser}
+                    <span
+                        class="hidden max-w-52 truncate text-sm text-muted md:inline"
+                        title={auth.currentUser.email}
+                    >
+                        {auth.currentUser.email}
+                        <span
+                            class="ml-1 rounded bg-surface-2 px-1.5 py-0.5 text-xs uppercase tracking-wide {auth.isAdmin
+                                ? 'text-sky-600 dark:text-sky-400'
+                                : ''}"
+                        >
+                            {auth.currentUser.role}
+                        </span>
+                    </span>
+                    <button
+                        type="button"
+                        onclick={() => {
+                            auth.logout().then(() => goto('/login'));
+                        }}
+                        class="rounded-md border border-line px-3 py-1.5 text-sm transition-colors hover:bg-surface-2"
+                    >
+                        Logout
+                    </button>
+                {/if}
                 <ConnectionBadge />
                 <button
                     type="button"

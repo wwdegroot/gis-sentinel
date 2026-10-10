@@ -7,6 +7,7 @@
         updateAlertPoint,
         ApiError
     } from '$lib/api';
+    import { auth } from '$lib/auth.svelte';
     import type { AlertPoint, ProbeObservation } from '$lib/types';
     import AlertPointModal from '$lib/components/AlertPointModal.svelte';
     import DeleteConfirm from '$lib/components/DeleteConfirm.svelte';
@@ -55,8 +56,9 @@
         return e instanceof Error ? e.message : String(e);
     }
 
-    /** Optimistic enable/disable with rollback on failure. */
+    /** Optimistic enable/disable with rollback on failure (admin only — plan Q3-b). */
     async function handleToggle(point: AlertPoint, enabled: boolean) {
+        if (!auth.isAdmin) return;
         const previous = point.enabled;
         point.enabled = enabled;
         busyId = point.id;
@@ -72,6 +74,7 @@
     }
 
     async function handleTest(point: AlertPoint) {
+        if (!auth.isAdmin) return;
         testingId = point.id;
         testTarget = { name: point.name, observation: null, error: '' };
         try {
@@ -85,7 +88,7 @@
     }
 
     async function handleDeleteConfirm() {
-        if (!deleting) return;
+        if (!deleting || !auth.isAdmin) return;
         const target = deleting;
         deleteBusy = true;
         actionError = '';
@@ -114,16 +117,18 @@
 <div class="flex flex-col gap-4">
     <div class="flex flex-wrap items-center justify-between gap-3">
         <h1 class="text-2xl font-bold">Services</h1>
-        <button
-            type="button"
-            onclick={() => {
-                editing = null;
-                modalOpen = true;
-            }}
-            class="rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500"
-        >
-            + New monitoring point
-        </button>
+        {#if auth.isAdmin}
+            <button
+                type="button"
+                onclick={() => {
+                    editing = null;
+                    modalOpen = true;
+                }}
+                class="rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500"
+            >
+                + New monitoring point
+            </button>
+        {/if}
     </div>
 
     {#if actionError}
@@ -165,23 +170,30 @@
         >
             <div class="text-3xl">🛰️</div>
             <div class="font-medium">No monitoring points yet</div>
-            <div class="text-sm text-muted">Add your first GIS endpoint to start monitoring.</div>
-            <button
-                type="button"
-                onclick={() => {
-                    editing = null;
-                    modalOpen = true;
-                }}
-                class="mt-2 rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500"
-            >
-                + New monitoring point
-            </button>
+            <div class="text-sm text-muted">
+                {auth.isAdmin
+                    ? 'Add your first GIS endpoint to start monitoring.'
+                    : 'No GIS endpoints are being monitored yet.'}
+            </div>
+            {#if auth.isAdmin}
+                <button
+                    type="button"
+                    onclick={() => {
+                        editing = null;
+                        modalOpen = true;
+                    }}
+                    class="mt-2 rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500"
+                >
+                    + New monitoring point
+                </button>
+            {/if}
         </div>
     {:else}
         <ServiceTable
             {points}
             {busyId}
             {testingId}
+            editable={auth.isAdmin}
             ontoggle={handleToggle}
             ontest={handleTest}
             onedit={(point) => {
@@ -196,7 +208,7 @@
     {/if}
 </div>
 
-{#if modalOpen}
+{#if modalOpen && auth.isAdmin}
     <AlertPointModal
         point={editing}
         onClose={() => {
@@ -207,7 +219,7 @@
     />
 {/if}
 
-{#if deleting}
+{#if deleting && auth.isAdmin}
     <DeleteConfirm
         point={deleting}
         busy={deleteBusy}

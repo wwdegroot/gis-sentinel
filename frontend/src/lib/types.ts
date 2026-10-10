@@ -47,6 +47,26 @@ export type WsMessage = WsSnapshot | WsAlert;
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 
 // ---------------------------------------------------------------------------
+// Auth (`/api/v1/auth`) — see docs/auth-plan.md §9
+// ---------------------------------------------------------------------------
+
+/** User role — backend serializes these exact strings (serde lowercase). */
+export type UserRole = 'admin' | 'viewer';
+
+/** Public user projection returned by `POST /auth/login` and `GET /auth/me`. */
+export interface User {
+    id: number;
+    email: string;
+    role: UserRole;
+}
+
+/** Body for `POST /api/v1/auth/login`. */
+export interface LoginPayload {
+    email: string;
+    password: string;
+}
+
+// ---------------------------------------------------------------------------
 // REST contracts (`/api/v1/alert-points`)
 // ---------------------------------------------------------------------------
 
