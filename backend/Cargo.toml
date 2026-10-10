@@ -28,3 +28,31 @@ redis = { version = "0.27", features = ["tokio-comp"] }
 deadpool-redis = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# typed validation of API request DTOs (task 2.1)
+validator = { version = "0.19", features = ["derive"] }
+# typed derive-based error enums (task 2.1)
+thiserror = "2"
+# application-bootstrap error handling in main.rs (task 2.1)
+anyhow = "1"
+# absolute URL parsing for request validation (task 2.1)
+url = "2"
+# dyn-compatible async traits for the repository/queue abstractions (see docs/tests.md)
+async-trait = "0.1.92"
+
+[features]
+# Compile/run the live-service smoke tests: `cargo test --features smoke-tests -- --ignored`.
+smoke-tests = []
+# Export in-memory fakes of the repo/queue traits for use by integration tests.
+test-utils = []
+
+[[test]]
+name = "db_smoke"
+required-features = ["smoke-tests"]
+
+[[test]]
+name = "queue_smoke"
+required-features = ["smoke-tests"]
+
+[[test]]
+name = "api_alert_points"
+required-features = ["test-utils"]

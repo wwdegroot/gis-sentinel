@@ -49,15 +49,15 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 
 ## ⚙️ Phase 2: Backend Services Implementation
 
-- [ ] **2.1 API Service (Alert Points CRUD)**
-  - [ ] Create REST routes under `/api/v1/alert-points`:
+- [x] **2.1 API Service (Alert Points CRUD)**
+  - [x] Create REST routes under `/api/v1/alert-points`:
     - `GET /api/v1/alert-points` - List all configured monitoring points (with filtering & pagination).
     - `POST /api/v1/alert-points` - Create a new monitoring point.
     - `GET /api/v1/alert-points/:id` - Fetch single monitoring point details and recent probe history.
     - `PUT /api/v1/alert-points/:id` - Update monitoring point settings.
     - `DELETE /api/v1/alert-points/:id` - Delete a monitoring point.
     - `POST /api/v1/alert-points/:id/test` - Trigger an on-demand probe check.
-  - [ ] Implement request payload validation (valid URLs, positive intervals/thresholds, recognized GIS service types).
+  - [x] Implement request payload validation (valid URLs, positive intervals/thresholds, recognized GIS service types).
 
 - [ ] **2.2 Scheduler Service (Queue Producer)**
   - [ ] Implement background scheduler loop (using `tokio::time::interval` or `tokio-cron-scheduler`).
@@ -157,10 +157,11 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 ## 🧪 Phase 5: Testing & Quality Assurance
 
 - [ ] **5.1 Backend Tests**
-  - [ ] Unit tests for GIS probe parsing and SLA calculation.
-  - [ ] Unit tests for alert state transitions (`New`, `Update`, `Remove`).
-  - [ ] Integration tests for REST CRUD API endpoints using Axum test utilities.
-  - [ ] Mock tests for Redis queue producer/consumer flows.
+  - [ ] Unit tests for GIS probe parsing and SLA calculation. *(blocked on task 2.3 — worker not implemented yet)*
+  - [ ] Unit tests for alert state transitions (`New`, `Update`, `Remove`). *(blocked on task 2.3 — worker not implemented yet)*
+  - [x] Integration tests for REST CRUD API endpoints using Axum test utilities. (`tests/api_alert_points.rs` — router over in-memory fakes, no live services; see `tests.md`)
+  - [x] Mock tests for Redis queue producer/consumer flows. (`src/queue/fake.rs` + `ProbeQueue` trait abstraction)
+  - [x] Feature-flag the live-service smoke tests (`smoke-tests` cargo feature) and abstract db/queue behind repository traits with in-memory fakes (see `tests.md`).
 
 - [ ] **5.2 Frontend Tests**
   - [ ] Unit tests for `SentinelSocket` state machine (connection, reconnection, message routing).
@@ -172,7 +173,7 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 ## 📌 Suggested Immediate Next Steps
 
 1. ✅ **Fix cross-platform embed path** in `backend/src/handlers/generic.rs` to allow compiling on Linux/macOS. (done as part of 1.1)
-2. **Add `docker-compose.yml`** with Postgres and Valkey/Redis for local service dependencies.
+2. ✅ **Add `docker-compose.yml`** with Postgres and Valkey/Redis for local service dependencies. (done as part of 1.4)
 3. ✅ **Implement Database & Schema** for `alert_points` and connect backend via `sqlx`. (done as part of 1.1, incl. repository layer + offline query cache)
-4. **Implement REST CRUD Endpoints** in backend and build the `/services` frontend management page.
+4. **Build the `/services` frontend management page.** (backend REST CRUD endpoints done as part of 2.1, covered by tests — see `tests.md`)
 5. **Implement Scheduler & Worker** loop to turn GIS Sentinel from mock data into a functioning monitoring engine.
