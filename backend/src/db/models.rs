@@ -19,6 +19,20 @@ pub enum ServiceType {
     Http,
 }
 
+impl ServiceType {
+    /// The `TEXT` representation stored in PostgreSQL / used in query filters.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wms => "WMS",
+            Self::Wfs => "WFS",
+            Self::Wmts => "WMTS",
+            Self::Oaf => "OAF",
+            Self::ArcGisRest => "ArcGIS_REST",
+            Self::Http => "HTTP",
+        }
+    }
+}
+
 /// HTTP method used when probing a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "UPPERCASE")]

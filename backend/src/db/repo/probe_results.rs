@@ -1,3 +1,8 @@
+//! PostgreSQL implementation of [`ProbeResultStore`] (task 2.1).
+//!
+//! The sqlx bodies are unchanged from the original free functions; they were
+//! only moved behind the trait abstraction in `repo::traits` (docs/tests.md).
+
 use crate::db::models::{NewProbeResult, ProbeResult};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -49,9 +54,9 @@ pub async fn insert(pool: &PgPool, result: NewProbeResult) -> Result<ProbeResult
         .raw_response_snippet
         .map(|s| s.chars().take(2000).collect::<String>());
 
-    sqlx::query_as!(
-        ProbeResult,
-        r#"
+        sqlx::query_as!(
+            ProbeResult,
+            r#"
         INSERT INTO probe_results (
             alert_point_id, response_time_ms, status_code,
             is_up, error_message, raw_response_snippet
@@ -67,26 +72,27 @@ pub async fn insert(pool: &PgPool, result: NewProbeResult) -> Result<ProbeResult
             error_message,
             raw_response_snippet
         "#,
-        result.alert_point_id,
-        result.response_time_ms,
-        result.status_code,
-        result.is_up,
-        result.error_message,
-        snippet,
-    )
-    .fetch_one(pool)
-    .await
-}
+            result.alert_point_id,
+            result.response_time_ms,
+            result.status_code,
+            result.is_up,
+            result.error_message,
+            snippet,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(RepoError::from_sqlx)
+    }
 
-/// Most recent probe results for an alert point, newest first.
-pub async fn list_recent(
-    pool: &PgPool,
-    alert_point_id: Uuid,
-    limit: i64,
-) -> Result<Vec<ProbeResult>, sqlx::Error> {
-    sqlx::query_as!(
-        ProbeResult,
-        r#"
+    /// Most recent probe results for an alert point, newest first.
+    async fn list_recent(
+        &self,
+        alert_point_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ProbeResult>, RepoError> {
+        sqlx::query_as!(
+            ProbeResult,
+            r#"
         SELECT
             id,
             alert_point_id,
@@ -101,12 +107,13 @@ pub async fn list_recent(
         ORDER BY timestamp DESC, id DESC
         LIMIT $2
         "#,
-        alert_point_id,
-        limit,
-    )
-    .fetch_all(pool)
-    .await
-}
+            alert_point_id,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(RepoError::from_sqlx)
+    }
 
 /// Graph points (timestamp/latency/is_up only) for an alert point within the
 /// last `hours`, oldest first. Capped at `limit` rows (oldest kept) to bound
@@ -189,9 +196,11 @@ pub async fn uptime_percentage(
         WHERE alert_point_id = $1
           AND timestamp > now() - make_interval(hours => $2)
         "#,
-        alert_point_id,
-        hours,
-    )
-    .fetch_one(pool)
-    .await
+            alert_point_id,
+            hours,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(RepoError::from_sqlx)
+    }
 }

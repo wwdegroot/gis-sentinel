@@ -26,6 +26,10 @@ use tower_http::request_id::MakeRequestUuid;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// State of the legacy demo WebSocket routes.
+///
+/// Database/queue pools live in `backend::api::ApiState` since task 2.1 and
+/// are consumed by the `/api/v1` REST routes (and later scheduler/worker).
 #[derive(Debug, Clone)]
 pub struct AppState {
     // broadcast::Sender is Send + Sync and all its methods take &self, so a
@@ -49,6 +53,9 @@ pub struct AppState {
 }
 
 #[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    let config = Config::from_env().context("invalid configuration")?;
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
@@ -64,10 +71,10 @@ async fn main() -> Result<()> {
     // database connection + migrations
     let db_pool = db::connect(&config.database_url)
         .await
-        .unwrap_or_else(|e| panic!("could not connect to database: {e}"));
+        .context("could not connect to database")?;
     db::run_migrations(&db_pool)
         .await
-        .unwrap_or_else(|e| panic!("database migrations failed: {e}"));
+        .context("database migrations failed")?;
     tracing::info!("database connected and migrations up to date");
 
     // Bootstrap admin (Q5): if BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD are
@@ -95,9 +102,9 @@ async fn main() -> Result<()> {
     // Valkey/Redis queue connection + health check.
     // Phase 1 keeps the server booting without a reachable Valkey — the queue
     // is not consumed yet; the scheduler/worker (Phase 2) will make it mandatory.
-    let redis_pool = queue::connect(&config.redis_url)
-        .unwrap_or_else(|e| panic!("could not create redis pool: {e}"));
-    match queue::health_check(&redis_pool).await {
+    let redis_pool = queue::connect(&config.redis_url).context("could not create redis pool")?;
+    let probe_queue = queue::RedisProbeQueue::new(redis_pool);
+    match probe_queue.health_check().await {
         Ok(()) => tracing::info!("valkey/redis reachable at {}", config.redis_url),
         Err(e) => tracing::warn!(
             "valkey/redis health check failed ({}): {e} — continuing without queue",
@@ -167,6 +174,11 @@ async fn main() -> Result<()> {
                 .layer(tower_http::request_id::PropagateRequestIdLayer::x_request_id()),
         );
 
+    // bind using SERVER_HOST/SERVER_PORT from the environment
+    let listener = tokio::net::TcpListener::bind((config.server_host.as_str(), config.server_port))
+        .await
+        .context("could not bind server address")?;
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
     // Start the server with graceful shutdown
     let addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -208,6 +220,8 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .await
+    .context("server error")?;
     .with_graceful_shutdown(shutdown_signal)
     .await?;
 

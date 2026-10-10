@@ -157,10 +157,11 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 ## 🧪 Phase 5: Testing & Quality Assurance
 
 - [ ] **5.1 Backend Tests**
-  - [ ] Unit tests for GIS probe parsing and SLA calculation.
-  - [ ] Unit tests for alert state transitions (`New`, `Update`, `Remove`).
-  - [ ] Integration tests for REST CRUD API endpoints using Axum test utilities.
-  - [ ] Mock tests for Redis queue producer/consumer flows.
+  - [ ] Unit tests for GIS probe parsing and SLA calculation. *(blocked on task 2.3 — worker not implemented yet)*
+  - [ ] Unit tests for alert state transitions (`New`, `Update`, `Remove`). *(blocked on task 2.3 — worker not implemented yet)*
+  - [x] Integration tests for REST CRUD API endpoints using Axum test utilities. (`tests/api_alert_points.rs` — router over in-memory fakes, no live services; see `tests.md`)
+  - [x] Mock tests for Redis queue producer/consumer flows. (`src/queue/fake.rs` + `ProbeQueue` trait abstraction)
+  - [x] Feature-flag the live-service smoke tests (`smoke-tests` cargo feature) and abstract db/queue behind repository traits with in-memory fakes (see `tests.md`).
 
 - [ ] **5.2 Frontend Tests**
   - [ ] Unit tests for `SentinelSocket` state machine (connection, reconnection, message routing).
