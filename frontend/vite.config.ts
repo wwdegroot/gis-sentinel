@@ -1,9 +1,10 @@
 /// <reference types="node" />
 import { defineConfig } from 'vitest/config';
 import { sveltekit } from '@sveltejs/kit/vite';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
-    plugins: [sveltekit()],
+    plugins: [sveltekit(), tailwindcss()],
 
     server: {
         // dev-mode proxy: the app speaks same-origin (`location.host`), so in
