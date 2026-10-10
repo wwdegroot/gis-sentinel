@@ -1,11 +1,114 @@
 //! User repository (auth, Option B).
 //!
-//! Backs `/api/v1/auth/{login,logout,me}` and the startup bootstrap-admin upsert.
-//! Server-side sessions live in Redis (`crate::auth::session`); this module only
-//! touches the `users` table (identity + argon2 hashes).
+//! Backs `/api/v1/auth/{login,logout,me}`, the admin user-management
+//! endpoints (`/api/v1/users`, task 2.7), and the startup bootstrap-admin
+//! upsert. Server-side sessions live in Redis (`crate::auth::session`); this
+//! module only touches the `users` table (identity + argon2 hashes).
 
 use crate::db::models::{Role, User};
 use sqlx::PgPool;
+
+// ---------------------------------------------------------------------------
+// User management (task 2.7, admin-only)
+// ---------------------------------------------------------------------------
+
+/// List all users ordered by creation (admin user-management table).
+pub async fn list(pool: &PgPool) -> Result<Vec<User>, sqlx::Error> {
+    sqlx::query_as!(
+        User,
+        r#"
+        SELECT id, email, password_hash, role AS "role: Role", created_at, updated_at
+        FROM users
+        ORDER BY created_at, id
+        "#
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Count users with the admin role (last-admin guard).
+pub async fn count_admins(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!" FROM users WHERE role = 'admin'
+        "#
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Change a user's email. Callers must revoke the user's sessions afterwards
+/// (the email is baked into the session payload).
+pub async fn update_email(
+    pool: &PgPool,
+    id: i64,
+    email: &str,
+) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as!(
+        User,
+        r#"
+        UPDATE users SET email = $2
+        WHERE id = $1
+        RETURNING id, email, password_hash, role AS "role: Role", created_at, updated_at
+        "#,
+        id,
+        email,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Change a user's password (`password_hash` must already be argon2-hashed).
+/// Callers must revoke the user's sessions afterwards.
+pub async fn update_password(
+    pool: &PgPool,
+    id: i64,
+    password_hash: &str,
+) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as!(
+        User,
+        r#"
+        UPDATE users SET password_hash = $2
+        WHERE id = $1
+        RETURNING id, email, password_hash, role AS "role: Role", created_at, updated_at
+        "#,
+        id,
+        password_hash,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Change a user's role. Callers must revoke the user's sessions afterwards
+/// (the role is baked into the session payload).
+pub async fn update_role(pool: &PgPool, id: i64, role: Role) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as!(
+        User,
+        r#"
+        UPDATE users SET role = $2
+        WHERE id = $1
+        RETURNING id, email, password_hash, role AS "role: Role", created_at, updated_at
+        "#,
+        id,
+        role as Role,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Delete a user by id. Returns `false` when the id did not exist.
+/// (`alert_points` rows have no user ownership, so nothing cascades.)
+pub async fn delete(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let result: sqlx::postgres::PgQueryResult = sqlx::query!("DELETE FROM users WHERE id = $1", id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Auth lookups
+// ---------------------------------------------------------------------------
 
 /// Look up a user by email (login flow).
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, sqlx::Error> {

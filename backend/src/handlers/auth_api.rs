@@ -76,6 +76,7 @@ pub fn router() -> Router<AppState> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/me", get(me))
+        .route("/change-password", post(change_password))
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +147,70 @@ pub async fn logout(
 
 pub async fn me(user: CurrentUser) -> Json<UserPublic> {
     Json(UserPublic::from(&user))
+}
+
+// ---------------------------------------------------------------------------
+// POST /change-password (self-service, any role)
+// ---------------------------------------------------------------------------
+
+/// Body for the self-service password change (Settings → Account).
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordPayload {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Rotate the caller's own password (plan §7 “my account”): verify the current
+/// password, re-hash the new one, then sign out every *other* device (the
+/// current session stays alive — the hash is not part of the session payload).
+pub async fn change_password(
+    State(app): State<AppState>,
+    jar: axum_extra::extract::CookieJar,
+    user: CurrentUser,
+    Json(payload): Json<ChangePasswordPayload>,
+) -> ApiResult<StatusCode> {
+    if payload.current_password.is_empty() {
+        return Err(ApiError::BadRequest(
+            "current password is required".to_string(),
+        ));
+    }
+    if payload.new_password.is_empty() || payload.new_password.len() > MAX_PASSWORD_LEN {
+        return Err(ApiError::Validation(vec![(
+            "new_password".to_string(),
+            "password must be between 8 and 1024 characters".to_string(),
+        )]));
+    }
+    if payload.new_password.len() < 8 {
+        return Err(ApiError::Validation(vec![(
+            "new_password".to_string(),
+            "password must be at least 8 characters".to_string(),
+        )]));
+    }
+
+    let db_user = repo::users::find_by_id(&app.db, user.id)
+        .await?
+        .ok_or(ApiError::NotFound("user"))?;
+    if !auth::password::verify_password(&payload.current_password, &db_user.password_hash) {
+        return Err(ApiError::Unauthorized(
+            "current password is incorrect".to_string(),
+        ));
+    }
+
+    let hash = auth::password::hash_password(&payload.new_password)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!(e).context("password hash")))?;
+    repo::users::update_password(&app.db, user.id, &hash).await?;
+
+    // Sign out other devices; keep this session alive (best-effort like logout).
+    if let Some(c) = jar.get(&app.config.session_cookie_name) {
+        let token = c.value().to_string();
+        if let Err(e) = auth::session::revoke_other_user_sessions(&app.redis, user.id, &token).await
+        {
+            tracing::warn!(user_id = user.id, error = %e, "failed to revoke other sessions");
+        }
+    }
+
+    tracing::info!(user_id = user.id, "user changed their own password");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ pub mod ws_protocol;
 use crate::config::Config;
 use crate::handlers::{
     alert_points_api, auth_api, generic::static_handler, sentinel_ws::ws_sentinel_handler,
+    users_api,
 };
 use backend::db;
 use backend::queue;
@@ -164,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws/sentinel", get(ws_sentinel_handler))
         .nest("/api/v1/alert-points", alert_points_api::router())
         .nest("/api/v1/auth", auth_api::router())
+        .nest("/api/v1/users", users_api::router())
         .with_state(app_state.clone())
         .layer(
             tower::ServiceBuilder::new()

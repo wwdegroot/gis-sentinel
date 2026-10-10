@@ -25,6 +25,10 @@ pub enum ApiError {
     /// Authenticated but lacking the required role.
     #[error("{0}")]
     Forbidden(String),
+    /// Semantically valid request that conflicts with current state (task 2.7):
+    /// duplicate email, deleting/demoting the last admin, deleting yourself.
+    #[error("{0}")]
+    Conflict(String),
     /// Payload failed validation; carries (field, message) pairs.
     #[error("validation failed")]
     Validation(Vec<(String, String)>),
@@ -82,6 +86,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone(), None)
             }
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone(), None),
             ApiError::Validation(fields) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",

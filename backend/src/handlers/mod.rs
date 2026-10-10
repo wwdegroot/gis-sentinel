@@ -3,3 +3,4 @@ pub mod auth_api;
 pub mod error;
 pub mod generic;
 pub mod sentinel_ws;
+pub mod users_api;
