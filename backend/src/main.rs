@@ -11,9 +11,10 @@ use crate::handlers::{
 };
 use backend::db;
 use backend::queue;
+use backend::queue::ProbeQueue as _;
 
 use crate::workers::{probe_worker, scheduler};
-use anyhow::Result;
+use anyhow::Context;
 use axum::extract::ws::Message;
 use axum::routing::{get, Router};
 use sqlx::PgPool;
@@ -55,11 +56,8 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    let config = Config::from_env().context("invalid configuration")?;
-async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-
     let config = Config::load();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -103,7 +101,7 @@ async fn main() -> Result<()> {
     // Phase 1 keeps the server booting without a reachable Valkey — the queue
     // is not consumed yet; the scheduler/worker (Phase 2) will make it mandatory.
     let redis_pool = queue::connect(&config.redis_url).context("could not create redis pool")?;
-    let probe_queue = queue::RedisProbeQueue::new(redis_pool);
+    let probe_queue = queue::RedisProbeQueue::new(redis_pool.clone());
     match probe_queue.health_check().await {
         Ok(()) => tracing::info!("valkey/redis reachable at {}", config.redis_url),
         Err(e) => tracing::warn!(
@@ -174,12 +172,8 @@ async fn main() -> Result<()> {
                 .layer(tower_http::request_id::PropagateRequestIdLayer::x_request_id()),
         );
 
-    // bind using SERVER_HOST/SERVER_PORT from the environment
-    let listener = tokio::net::TcpListener::bind((config.server_host.as_str(), config.server_port))
-        .await
-        .context("could not bind server address")?;
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
-    // Start the server with graceful shutdown
+    // bind using the typed configuration and start the server with graceful
+    // shutdown.
     let addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
@@ -220,8 +214,6 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    .context("server error")?;
     .with_graceful_shutdown(shutdown_signal)
     .await?;
 

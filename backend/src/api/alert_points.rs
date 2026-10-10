@@ -398,10 +398,17 @@ pub async fn test(
     let point = state.alert_points.get(id).await?;
     let job = ProbeJob {
         target_id: point.id,
+        target_name: point.name,
         url: point.url,
         service_type: point.service_type,
         expected_time_ms: point.expected_response_time_ms,
         timeout_ms: DEFAULT_PROBE_TIMEOUT_MS,
+        http_method: point.http_method,
+        custom_headers: serde_json::from_value(point.custom_headers).unwrap_or_default(),
+        auth: point
+            .auth_config
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     };
     state.queue.enqueue_probe_job(&job).await?;
     Ok((

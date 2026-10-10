@@ -101,16 +101,21 @@ impl ProbeQueue for FakeProbeQueue {
 mod tests {
     use super::*;
     use crate::db::models::ServiceType;
+    use std::collections::HashMap;
     use crate::queue::PROBE_QUEUE_KEY;
     use uuid::Uuid;
 
     fn job(target: u8) -> ProbeJob {
         ProbeJob {
             target_id: Uuid::now_v7(),
+            target_name: format!("target-{target}"),
             url: format!("https://target-{target}.example.com/wms"),
             service_type: ServiceType::Wms,
             expected_time_ms: 500,
             timeout_ms: 2000,
+            http_method: crate::db::models::HttpMethod::Get,
+            custom_headers: HashMap::new(),
+            auth: None,
         }
     }
 

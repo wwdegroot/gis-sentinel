@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::db::models::{
     ActiveAlert, AlertPoint, AlertType, HttpMethod, NewActiveAlert, NewAlertPoint, NewProbeResult,
-    ProbeResult, ServiceType, UpdateAlertPoint,
+    ProbeResult, ServiceStatus, ServiceType, UpdateAlertPoint,
 };
 use crate::db::repo::alert_points::ListFilter;
 use crate::db::repo::traits::{
@@ -270,6 +270,7 @@ impl AlertPointRepository for FakeAlertPointRepository {
             enabled: new.enabled,
             created_at: now,
             updated_at: now,
+            last_checked_at: None,
         };
         let mut state = self.0.lock();
         state.alert_points.insert(point.id, point.clone());
@@ -510,6 +511,7 @@ impl ActiveAlertStore for FakeActiveAlertStore {
             id,
             alert_point_id: alert.alert_point_id,
             alert_type: alert.alert_type,
+            status: alert.status,
             reason: alert.reason,
             triggered_at: Utc::now(),
             resolved_at: None,
@@ -593,6 +595,7 @@ pub fn sample_new_alert(alert_point_id: Uuid, alert_type: AlertType) -> NewActiv
     NewActiveAlert {
         alert_point_id,
         alert_type,
+        status: ServiceStatus::Down,
         reason: "probe failed".to_string(),
     }
 }

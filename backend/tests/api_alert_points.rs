@@ -498,7 +498,7 @@ async fn detail_renders_probe_history_and_open_alert() {
     let point_id = uuid::Uuid::parse_str(id).unwrap();
 
     // seed history through the fakes directly (worker does this in production)
-    use backend::db::models::{AlertType, NewActiveAlert, NewProbeResult};
+    use backend::db::models::{AlertType, NewActiveAlert, NewProbeResult, ServiceStatus};
     use backend::db::repo::traits::{ActiveAlertStore, ProbeResultStore};
     h.stores()
         .probe_results
@@ -517,6 +517,7 @@ async fn detail_renders_probe_history_and_open_alert() {
         .insert(NewActiveAlert {
             alert_point_id: point_id,
             alert_type: AlertType::Update,
+            status: ServiceStatus::Degraded,
             reason: "latency exceeded".to_string(),
         })
         .await

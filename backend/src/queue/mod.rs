@@ -13,10 +13,10 @@
 //! from [`queue::fake`] (see `docs/tests.md`).
 
 use crate::db::models::{HttpMethod, ServiceType};
+use async_trait::async_trait;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
@@ -239,4 +239,36 @@ pub async fn release_inflight(pool: &RedisPool, target_id: Uuid) -> Result<(), Q
     let mut conn = pool.get().await?;
     conn.del::<_, ()>(key).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Free-function wrappers around [`RedisProbeQueue`]
+//
+// The scheduler/probe-worker paths share the raw `RedisPool` via `AppState`,
+// while the REST API holds an `Arc<dyn ProbeQueue>`. These helpers let the
+// worker code use the same queue logic without constructing a queue value.
+// ---------------------------------------------------------------------------
+
+/// Push a probe job onto the queue (thin wrapper over [`RedisProbeQueue`]).
+pub async fn enqueue_probe_job(pool: &RedisPool, job: &ProbeJob) -> Result<u64, QueueError> {
+    RedisProbeQueue::new(pool.clone())
+        .enqueue_probe_job(job)
+        .await
+}
+
+/// Block up to `timeout` waiting for the next probe job (thin wrapper over
+/// [`RedisProbeQueue`]). Returns `None` on timeout without a pending job.
+pub async fn dequeue_probe_job(
+    pool: &RedisPool,
+    timeout: Duration,
+) -> Result<Option<ProbeJob>, QueueError> {
+    RedisProbeQueue::new(pool.clone())
+        .dequeue_probe_job(timeout)
+        .await
+}
+
+/// Number of probe jobs currently waiting in the queue (thin wrapper over
+/// [`RedisProbeQueue`]).
+pub async fn queue_len(pool: &RedisPool) -> Result<u64, QueueError> {
+    RedisProbeQueue::new(pool.clone()).queue_len().await
 }

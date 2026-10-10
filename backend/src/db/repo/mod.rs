@@ -10,4 +10,10 @@ pub mod alert_points;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fake;
 pub mod probe_results;
+pub mod traits;
 pub mod users;
+
+pub use traits::{ActiveAlertStore, AlertPointRepository, ProbeResultStore, RepoError};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use fake::FakeStores;

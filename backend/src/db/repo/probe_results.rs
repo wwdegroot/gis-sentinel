@@ -79,17 +79,16 @@ pub async fn insert(pool: &PgPool, result: NewProbeResult) -> Result<ProbeResult
             result.error_message,
             snippet,
         )
-        .fetch_one(&self.pool)
+        .fetch_one(pool)
         .await
-        .map_err(RepoError::from_sqlx)
-    }
+}
 
-    /// Most recent probe results for an alert point, newest first.
-    async fn list_recent(
-        &self,
-        alert_point_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<ProbeResult>, RepoError> {
+/// Most recent probe results for an alert point, newest first.
+pub async fn list_recent(
+    pool: &PgPool,
+    alert_point_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ProbeResult>, sqlx::Error> {
         sqlx::query_as!(
             ProbeResult,
             r#"
@@ -107,13 +106,12 @@ pub async fn insert(pool: &PgPool, result: NewProbeResult) -> Result<ProbeResult
         ORDER BY timestamp DESC, id DESC
         LIMIT $2
         "#,
-            alert_point_id,
-            limit,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
+        alert_point_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
 
 /// Graph points (timestamp/latency/is_up only) for an alert point within the
 /// last `hours`, oldest first. Capped at `limit` rows (oldest kept) to bound
@@ -196,11 +194,9 @@ pub async fn uptime_percentage(
         WHERE alert_point_id = $1
           AND timestamp > now() - make_interval(hours => $2)
         "#,
-            alert_point_id,
-            hours,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
+        alert_point_id,
+        hours,
+    )
+    .fetch_one(pool)
+    .await
 }

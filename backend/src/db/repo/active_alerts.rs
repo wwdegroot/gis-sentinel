@@ -22,22 +22,21 @@ pub async fn insert(pool: &PgPool, alert: NewActiveAlert) -> Result<ActiveAlert,
     .await
 }
 
-    /// Resolve all open alerts of an alert point (`Remove` lifecycle event).
-    /// Returns the number of resolved rows.
-    async fn resolve(&self, alert_point_id: Uuid) -> Result<u64, RepoError> {
-        let result = sqlx::query!(
-            r#"
+/// Resolve all open alerts of an alert point (`Remove` lifecycle event).
+/// Returns the number of resolved rows.
+pub async fn resolve(pool: &PgPool, alert_point_id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query!(
+        r#"
         UPDATE active_alerts
         SET resolved_at = now()
         WHERE alert_point_id = $1 AND resolved_at IS NULL
         "#,
-            alert_point_id,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)?;
-        Ok(result.rows_affected())
-    }
+        alert_point_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
 
 /// All currently open alerts with their targets' metadata, newest first.
 /// This is the source for the WebSocket snapshot-on-connect (task 2.4).
@@ -61,11 +60,10 @@ pub async fn list_open_with_point(pool: &PgPool) -> Result<Vec<OpenAlertWithPoin
         WHERE a.resolved_at IS NULL
         ORDER BY a.triggered_at DESC, a.id DESC
         "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
+    )
+    .fetch_all(pool)
+    .await
+}
 
 /// Update the open alert of an alert point (`Update` lifecycle event):
 /// replaces type, status and reason, keeping `triggered_at`. Returns the
@@ -109,10 +107,8 @@ pub async fn latest_open(
         ORDER BY triggered_at DESC, id DESC
         LIMIT 1
         "#,
-            alert_point_id,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
+        alert_point_id,
+    )
+    .fetch_optional(pool)
+    .await
 }
