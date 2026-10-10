@@ -79,11 +79,13 @@ async fn main() -> anyhow::Result<()> {
     // set, upsert the admin row idempotently on every boot (rotating the env
     // value rotates the password). Without these, no local admin exists until
     // one is provisioned (future CLI / Option D provisioning).
-    if let (Some(email), Some(password)) =
-        (&config.bootstrap_admin_email, &config.bootstrap_admin_password)
-    {
+    if let (Some(email), Some(password)) = (
+        &config.bootstrap_admin_email,
+        &config.bootstrap_admin_password,
+    ) {
         match auth::password::hash_password(password) {
-            Ok(hash) => match db::repo::users::upsert_bootstrap_admin(&db_pool, email, &hash).await {
+            Ok(hash) => match db::repo::users::upsert_bootstrap_admin(&db_pool, email, &hash).await
+            {
                 Ok(u) => tracing::info!(
                     user_id = u.id,
                     email = %u.email,

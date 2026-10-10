@@ -101,8 +101,8 @@ impl ProbeQueue for FakeProbeQueue {
 mod tests {
     use super::*;
     use crate::db::models::ServiceType;
-    use std::collections::HashMap;
     use crate::queue::PROBE_QUEUE_KEY;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     fn job(target: u8) -> ProbeJob {

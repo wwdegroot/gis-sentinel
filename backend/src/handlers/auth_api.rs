@@ -158,9 +158,7 @@ fn build_session_cookie(config: &crate::config::Config, token: &str) -> Cookie<'
         .secure(config.cookie_secure)
         .same_site(parse_samesite(&config.cookie_samesite))
         .path("/")
-        .max_age(CookieDuration::seconds(
-            config.session_ttl_secs as i64,
-        ));
+        .max_age(CookieDuration::seconds(config.session_ttl_secs as i64));
     if let Some(domain) = config.cookie_domain.as_deref() {
         b = b.domain(domain.to_string());
     }

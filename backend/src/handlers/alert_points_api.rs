@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::auth::CurrentUser;
+use crate::db::models::Role;
 use crate::db::models::{ActiveAlert, AlertPoint, AlertType, ServiceType};
 use crate::db::repo;
 use crate::handlers::error::{ApiError, ApiResult};
-use crate::auth::CurrentUser;
-use crate::db::models::Role;
 use crate::probe::client::{build_probe_client, run_http_probe};
 use crate::ws_protocol::AlertEvent;
 use crate::AppState;

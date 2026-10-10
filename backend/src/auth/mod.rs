@@ -23,7 +23,7 @@ use std::net::{IpAddr, SocketAddr};
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::FromRequestParts;
 use axum::http::header::COOKIE;
-use axum::http::{HeaderMap, request::Parts};
+use axum::http::{request::Parts, HeaderMap};
 
 use crate::db::models::Role;
 use crate::db::repo;

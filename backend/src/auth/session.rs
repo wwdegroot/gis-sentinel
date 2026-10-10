@@ -37,11 +37,7 @@ impl From<&User> for SessionData {
 
 /// Create a new session: generate a token, store `data` with `ttl_secs`, return
 /// the token (to be set as a cookie by the caller).
-pub async fn create(
-    pool: &RedisPool,
-    user: &User,
-    ttl_secs: u64,
-) -> Result<String, QueueError> {
+pub async fn create(pool: &RedisPool, user: &User, ttl_secs: u64) -> Result<String, QueueError> {
     let token = Uuid::new_v4().to_string();
     let payload = serde_json::to_string(&SessionData::from(user))?;
     let key = format!("{SESSION_KEY_PREFIX}{token}");

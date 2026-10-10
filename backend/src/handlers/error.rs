@@ -81,9 +81,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(msg) => {
                 (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone(), None)
             }
-            ApiError::Forbidden(msg) => {
-                (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None)
-            }
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None),
             ApiError::Validation(fields) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",

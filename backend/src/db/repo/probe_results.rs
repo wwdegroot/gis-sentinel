@@ -54,9 +54,9 @@ pub async fn insert(pool: &PgPool, result: NewProbeResult) -> Result<ProbeResult
         .raw_response_snippet
         .map(|s| s.chars().take(2000).collect::<String>());
 
-        sqlx::query_as!(
-            ProbeResult,
-            r#"
+    sqlx::query_as!(
+        ProbeResult,
+        r#"
         INSERT INTO probe_results (
             alert_point_id, response_time_ms, status_code,
             is_up, error_message, raw_response_snippet
@@ -72,15 +72,15 @@ pub async fn insert(pool: &PgPool, result: NewProbeResult) -> Result<ProbeResult
             error_message,
             raw_response_snippet
         "#,
-            result.alert_point_id,
-            result.response_time_ms,
-            result.status_code,
-            result.is_up,
-            result.error_message,
-            snippet,
-        )
-        .fetch_one(pool)
-        .await
+        result.alert_point_id,
+        result.response_time_ms,
+        result.status_code,
+        result.is_up,
+        result.error_message,
+        snippet,
+    )
+    .fetch_one(pool)
+    .await
 }
 
 /// Most recent probe results for an alert point, newest first.
@@ -89,9 +89,9 @@ pub async fn list_recent(
     alert_point_id: Uuid,
     limit: i64,
 ) -> Result<Vec<ProbeResult>, sqlx::Error> {
-        sqlx::query_as!(
-            ProbeResult,
-            r#"
+    sqlx::query_as!(
+        ProbeResult,
+        r#"
         SELECT
             id,
             alert_point_id,
