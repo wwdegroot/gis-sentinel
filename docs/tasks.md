@@ -24,7 +24,7 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 
 ## 🚀 Phase 1: Infrastructure & Data Architecture
 
-- [ ] **1.1 PostgreSQL Database Integration**
+- [x] **1.1 PostgreSQL Database Integration**
   - [x] Choose and configure an async query engine `sqlx` with Postgres driver. (sqlx 0.8, compile-time checked `query!` macros + committed `.sqlx` offline cache; see `phase1.md`)
   - [x] Implement database migrations (`sqlx-cli` or embedded migrations). (embedded `sqlx::migrate!()`, applied at startup; `sqlx-cli` 0.8.6 for `prepare`)
   - [x] Design schema for:
