@@ -16,12 +16,16 @@ import type {
     AlertPointDetail,
     AlertPointList,
     AlertPointPatch,
+    ChangePasswordPayload,
+    NewUser,
     ProbeHistory,
     NewAlertPoint,
     ProbeIncident,
     ProbeObservation,
     ServiceType,
     User,
+    UserAccount,
+    UserPatch,
     LoginPayload
 } from './types';
 
@@ -164,6 +168,41 @@ export function getAlertPointHistory(id: string, hours: number): Promise<ProbeHi
 /** GET /api/v1/alert-points/{id}/incidents?hours= — failed probes with error detail. */
 export function getAlertPointIncidents(id: string, hours: number): Promise<ProbeIncident[]> {
     return request(`/api/v1/alert-points/${id}/incidents?hours=${hours}`);
+}
+
+// ---------------------------------------------------------------------------
+// Users (`/api/v1/users`) — admin-only endpoints (tasks 2.7 / 3.7)
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/users — list all accounts (admin only; viewers get 403). */
+export function listUsers(): Promise<UserAccount[]> {
+    return request('/api/v1/users');
+}
+
+/** POST /api/v1/users — create a user. Returns the created account (201). */
+export function createUser(payload: NewUser): Promise<UserAccount> {
+    return request('/api/v1/users', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+/** POST /api/v1/users/{id}/update — partial edit (email/role/password rotation). */
+export function updateUser(id: number, patch: UserPatch): Promise<UserAccount> {
+    return request(`/api/v1/users/${id}/update`, {
+        method: 'POST',
+        body: JSON.stringify(patch)
+    });
+}
+
+/** POST /api/v1/users/{id}/delete — delete the account (204). */
+export async function deleteUser(id: number): Promise<void> {
+    await request<void>(`/api/v1/users/${id}/delete`, { method: 'POST' });
+}
+
+/** POST /api/v1/auth/change-password — rotate own password (other devices signed out). */
+export async function changePassword(payload: ChangePasswordPayload): Promise<void> {
+    await request<void>('/api/v1/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+    });
 }
 
 /**

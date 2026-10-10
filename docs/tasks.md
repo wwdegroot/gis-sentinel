@@ -2,7 +2,7 @@
 
 This document outlines the roadmap and missing components for **GIS Sentinel**, based on the architecture described in [README.md](./README.md) and the current state of `backend/` and `frontend/`.
 
-> **Progress:** Phase 1 ✅ (`phase1.md`) · Phase 2 ✅ (`phase2.md`) · Phase 3 ✅ (`phase3.md`) · Phase 4+ pending
+> **Progress:** Phase 1 ✅ (`phase1.md`) · Phase 2 ✅ (`phase2.md`) · Phase 3 ✅ (`phase3.md`) · Auth ✅ (`auth-plan.md`) · User Management ✅ (`users-admin-plan.md`) · Phase 4+ pending
 
 ---
 
@@ -18,13 +18,15 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 | **Backend Web Server** | Axum server with WebSockets and embedded frontend | ⚠️ Partial (Basic WebSocket echo & mock alert streaming; Windows-specific embed path) |
 | **Frontend Dashboard** | Real-time monitoring dashboard with live status cards and metrics | ⚠️ Partial (Minimal raw key-value display prototype) |
 | **Frontend CRUD UI** | Management interface to configure GIS endpoints, thresholds, intervals | ❌ Missing |
+| **Authentication (per-user sessions, roles)** | Auth plan (`docs/implemented/auth-plan.md`): session cookie + Redis store, admin/viewer roles, WS cookie auth | ✅ Implemented |
+| **User management (admin-only user CRUD)** | Users plan (`docs/implemented/users-admin-plan.md`, report §10): `/api/v1/users` endpoints + `/users` page + self-service password change | ✅ Implemented (integration test over fakes pending) |
 | **DevOps / Infra** | Docker compose, CI/CD, production builds | ❌ Missing |
 
 ---
 
 ## 🚀 Phase 1: Infrastructure & Data Architecture
 
-- [ ] **1.1 PostgreSQL Database Integration**
+- [x] **1.1 PostgreSQL Database Integration**
   - [x] Choose and configure an async query engine `sqlx` with Postgres driver. (sqlx 0.8, compile-time checked `query!` macros + committed `.sqlx` offline cache; see `phase1.md`)
   - [x] Implement database migrations (`sqlx-cli` or embedded migrations). (embedded `sqlx::migrate!()`, applied at startup; `sqlx-cli` 0.8.6 for `prepare`)
   - [x] Design schema for:
@@ -93,6 +95,33 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 
 ---
 
+- [x] **2.6 Authentication & Session Access Control** ✅ implemented (see `auth-plan.md`)
+  - [x] Design: one swappable `CurrentUser` extractor (Option B now, Option D later) — every protected handler takes `CurrentUser` (`FromRequestParts`); per-handler auth instead of a router-wide layer. (auth-plan §0/§6)
+  - [x] Migration `0004_users.sql`: `users` table (unique email, argon2 `password_hash`, `role` `admin`/`viewer`, `updated_at` trigger). (auth-plan §3)
+  - [x] `src/auth/mod.rs` — `CurrentUser` + `AuthSource`:
+    - [x] `Session` source: `sentinel_session` cookie (random UUID v4 token, Q6) → Redis lookup; sliding TTL refreshed on every authenticated request.
+    - [x] `TrustedProxy` source hook (Option D upgrade path): `ENABLE_TRUSTED_PROXY_AUTH` + `TRUSTED_PROXY_IP` + `X-Authenticated-User`, IP-guarded; user row upserted by email on first proxied request. (running an IdP behind the proxy is deferred — §14)
+  - [x] `src/auth/password.rs` — argon2 `hash_password`/`verify_password` (Q2) + hash/verify round-trip unit tests.
+  - [x] `src/auth/session.rs` — Redis session store: `create` / `get` (sliding TTL refresh) / `delete` (logout = `DEL`). (Q1)
+  - [x] `db/repo/users.rs` — `find_by_email` / `find_by_id` / `upsert_bootstrap_admin` (in the `.sqlx` offline cache).
+  - [x] `handlers/auth_api.rs` — `POST /api/v1/auth/login` (public; sets the cookie), `POST /api/v1/auth/logout` (clears cookie + Redis session), `GET /api/v1/auth/me` (`CurrentUser` extractor → 401 unauthenticated).
+  - [x] Role split (Q3-b): read routes (`GET /api/v1/alert-points...`) → admin or viewer; write routes (`POST /`, `/{id}/{update,delete,test}`) → `403` unless `Role::Admin`.
+  - [x] WebSocket auth (Q7): `/ws/sentinel` handler extracts `CurrentUser` — cookie rides the same-origin WS upgrade, no `?token=` fallback.
+  - [x] CSRF posture (Q4-a): cookie `HttpOnly` + `COOKIE_SECURE` + `COOKIE_SAMESITE` (default `strict`), JSON-only mutation endpoints → no CSRF token needed.
+  - [x] Admin bootstrap (Q5-a): idempotent env-var upsert (`BOOTSTRAP_ADMIN_EMAIL`/`BOOTSTRAP_ADMIN_PASSWORD`) on startup after migrations; password rotates to the env value when set.
+  - [x] Config + `backend/.env.example`: `SESSION_COOKIE_NAME`, `SESSION_TTL_SECONDS`, `COOKIE_SECURE`, `COOKIE_SAMESITE`, `COOKIE_DOMAIN`, `BOOTSTRAP_ADMIN_EMAIL`, `BOOTSTRAP_ADMIN_PASSWORD`, `ENABLE_TRUSTED_PROXY_AUTH`, `TRUSTED_PROXY_IP`.
+
+- [x] **2.7 User Management API (admin-only user CRUD)** ✅ implemented (see `users-admin-plan.md` §10)
+  - [x] Extend `db/repo/users.rs`: `list`, `delete`, `update_email`/`update_password`/`update_role`, `count_admins` (+ `cargo sqlx prepare` to keep the `.sqlx` offline cache green). *(plan §4, step 1)*
+  - [x] `auth/session.rs`: SADD `sentinel:session_idx:{user_id}` index in `create()`; new `revoke_user_sessions(pool, user_id)` (+ `revoke_other_user_sessions` for self-service password change). *(plan §3, step 2)*
+  - [x] `handlers/users_api.rs` (NEW): `GET /api/v1/users` (list), `POST /api/v1/users` (create → 201 `UserAccount`), `POST /api/v1/users/{id}/update` (partial patch: `email?`/`password?`/`role?`), `POST /api/v1/users/{id}/delete` (→ 204). *(plan §2, step 3)*
+  - [x] Access control: handler-level `CurrentUser` + `require_admin` (mirrors `alert_points_api.rs`) — user list itself is **admin-only** (viewers 403; least exposure of account data). *(plan Q2-a, step 3)*
+  - [x] Last-admin & self rules (Q3): reject demoting/deleting the **last admin** and deleting **yourself** and demoting **yourself** (409 `ApiError::Conflict` — new variant); admin password rotation on edit (absent field = unchanged, argon2). *(plan Q3/Q5)*
+  - [x] Session revocation on **any** successful update/delete (role/email are baked into the session payload) → affected live sessions 401 on next request. *(plan §3)*
+  - [x] Error mapping: duplicate email → 409 `ApiError`; validation errors (bad email, short password, invalid role) → 422; `/api/v1/users` nested under the auth router in `main.rs`. *(plan §2/§4, step 4)*
+  - [x] Self-service password change (added beyond plan §7): `POST /api/v1/auth/change-password` — verifies current password, keeps the current session alive, signs out other devices.
+  - [x] Tests: handler unit tests (validation + guards, no Redis), `#[ignore]` Redis revocation round-trips in `session.rs` (verified against live Valkey); live curl smoke of all cases (401/403/201/409/422/revocation). *(plan §6, step 7 — `tests/api_users.rs` over fakes still pending)*
+
 ## 🎨 Phase 3: Frontend Development & UI/UX
 
 - [x] **3.1 WebSocket Client Improvements (`sentinelSocket.svelte.ts`)** ✅ implemented (see `phase3.md` §1)
@@ -136,6 +165,23 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 
 ---
 
+- [x] **3.6 Authentication UI (Login, Session State & Route Gating)** ✅ implemented (see `auth-plan.md` §9)
+  - [x] `src/lib/auth.svelte.ts` — `currentUser` state, `init()` resolves the session via `/auth/me` on app load, `login()`/`logout()` actions, `isAdmin` derived for button gating; auto-`goto('/login')` on any mid-session 401.
+  - [x] `src/lib/api.ts` — `login`, `logout`, `me`; same-origin credentials; 401 → `UnauthorizedError` wired to the global `setUnauthorizedHandler` (installed by `auth.svelte.ts`).
+  - [x] `/login` page — email/password form with error display; redirects to `/` on success and when already authenticated.
+  - [x] `routes/+layout.svelte` — `auth.init()` on mount, redirect to `/login` when unauthenticated, nav shows user email + Logout; app-wide socket lifecycle follows auth state (connects after login, user-closed on logout).
+  - [x] `/services` page — admin-only gating: Create/Edit/Delete/Test-now hidden for viewers (read-only table, toggle/edit modal disabled). (Q3-b frontend half)
+  - [x] `src/lib/types.ts` — `User { id, email, role }`, `UserRole`, `LoginPayload`.
+  - Note: no change to `sentinelSocket.svelte.ts` — the session cookie rides the WS upgrade same-origin.
+
+- [x] **3.7 Users Management Page (`/users`)** ✅ implemented (see `users-admin-plan.md` §10.2)
+  - [x] `src/lib/types.ts` — `UserAccount` (public user + timestamps), `NewUser { email, password, role }`, `UserPatch`, `ChangePasswordPayload`; `src/lib/api.ts` — `listUsers` / `createUser` / `updateUser(id, patch)` / `deleteUser(id)` / `changePassword` (same fetch style as alert-point fns).
+  - [x] `/users` page (NEW) — admin-only (`auth.ready` + `auth.isAdmin` gate with redirect to `/`), user table (email, role, created, updated) + Create modal + role select + Edit modal (optional password reset) + Delete confirm; self-delete and self-role-change disabled client-side (server enforces 409 too).
+  - [x] Components `src/lib/components/users/` (NEW) — `UsersTable`, `UserCreateModal`, `UserEditModal`, `UserDeleteConfirm`. (State is page-local `$state` + optimistic list updates, mirroring `/services` — no separate store needed.)
+  - [x] Nav link **Users** (`/users`) in `routes/+layout.svelte` — hidden when `!auth.isAdmin` (mirrors the `/services` gating).
+  - [x] **Settings → Account** (NEW, beyond plan): self-service password change form (current + new + repeat) calling `POST /auth/change-password`; other devices signed out, current session stays alive.
+  - [x] No change to `sentinelSocket.svelte.ts` — a role/email change revokes that user's sessions → global 401 → `/login` → reconnect after re-login.
+
 ## 📦 Phase 4: DevOps, Build & Deployment
 
 - [ ] **4.1 Production Multi-Stage Dockerfile**
@@ -178,4 +224,4 @@ This document outlines the roadmap and missing components for **GIS Sentinel**, 
 4. ✅ **Implement REST CRUD Endpoints** in backend (done as part of 2.1; the `/services` frontend page is task 3.4) and build the `/services` frontend management page.
 5. ✅ **Implement Scheduler & Worker** loop to turn GIS Sentinel from mock data into a functioning monitoring engine. (done as part of 2.2–2.4, incl. real-time WebSocket hub)
 
-→ Next up: **Phase 3 (Frontend)** — starting with task 3.1, since the backend WS wire contract changed in Phase 2.
+→ Next up: **Phase 4 (DevOps)** — starting with the multi-stage Dockerfile. User management (tasks 2.7 + 3.7, `docs/implemented/users-admin-plan.md`) is done (the fake-based `tests/api_users.rs` integration harness remains); Authentication (Option B, sessions + roles) is done; Option D (SSO via trusted reverse proxy) stays documented in `auth-plan.md` as the config-flip upgrade path.

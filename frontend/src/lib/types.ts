@@ -67,6 +67,42 @@ export interface LoginPayload {
 }
 
 // ---------------------------------------------------------------------------
+// User management (`/api/v1/users`) — admin only (tasks 2.7 / 3.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * Account row as returned by the user-management endpoints: the public user
+ * projection plus timestamps for the admin table.
+ */
+export interface UserAccount extends User {
+    /** ISO 8601. */
+    created_at: string;
+    /** ISO 8601. */
+    updated_at: string;
+}
+
+/** Payload for `POST /api/v1/users` (create). */
+export interface NewUser {
+    email: string;
+    password: string;
+    role: UserRole;
+}
+
+/** Partial update payload for `POST /api/v1/users/{id}/update` — set fields only. */
+export interface UserPatch {
+    email?: string;
+    /** When present, the password is rotated. Absent = unchanged. */
+    password?: string;
+    role?: UserRole;
+}
+
+/** Body for `POST /api/v1/auth/change-password` (self-service, Settings page). */
+export interface ChangePasswordPayload {
+    current_password: string;
+    new_password: string;
+}
+
+// ---------------------------------------------------------------------------
 // REST contracts (`/api/v1/alert-points`)
 // ---------------------------------------------------------------------------
 
