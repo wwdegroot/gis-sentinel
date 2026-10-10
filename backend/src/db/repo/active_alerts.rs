@@ -1,66 +1,26 @@
-//! PostgreSQL implementation of [`ActiveAlertStore`] (task 2.1).
-//!
-//! The sqlx bodies are unchanged from the original free functions; they were
-//! only moved behind the trait abstraction in `repo::traits` (docs/tests.md).
-
-use crate::db::models::{ActiveAlert, AlertType, NewActiveAlert};
-use crate::db::repo::traits::{ActiveAlertStore, RepoError};
-use async_trait::async_trait;
+use crate::db::models::{
+    ActiveAlert, AlertType, NewActiveAlert, OpenAlertWithPoint, ServiceStatus, ServiceType,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// sqlx-backed `active_alerts` repository wrapping a connection pool.
-#[derive(Debug, Clone)]
-pub struct PgActiveAlertStore {
-    pool: PgPool,
-}
-
-impl PgActiveAlertStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-}
-
-/// Map the `uq_active_alerts_point` unique-index violation to `Conflict`.
-fn map_unique_violation(e: sqlx::Error) -> RepoError {
-    match &e {
-        sqlx::Error::Database(db_err) => {
-            if db_err.constraint() == Some("uq_active_alerts_point") {
-                RepoError::Conflict
-            } else {
-                RepoError::from_sqlx(e)
-            }
-        }
-        _ => RepoError::from_sqlx(e),
-    }
-}
-
-#[async_trait]
-impl ActiveAlertStore for PgActiveAlertStore {
-    /// Raise a new alert for an alert point.
-    /// `RepoError::Conflict` when an open alert already exists for the point.
-    async fn insert(&self, alert: NewActiveAlert) -> Result<ActiveAlert, RepoError> {
-        sqlx::query_as!(
-            ActiveAlert,
-            r#"
-        INSERT INTO active_alerts (alert_point_id, alert_type, reason)
-        VALUES ($1, $2, $3)
-        RETURNING
-            id,
-            alert_point_id,
-            alert_type AS "alert_type: AlertType",
-            reason,
-            triggered_at,
-            resolved_at
+/// Raise a new alert for an alert point.
+pub async fn insert(pool: &PgPool, alert: NewActiveAlert) -> Result<ActiveAlert, sqlx::Error> {
+    sqlx::query_as!(
+        ActiveAlert,
+        r#"
+        INSERT INTO active_alerts (alert_point_id, alert_type, status, reason)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, alert_point_id, alert_type AS "alert_type: AlertType", status AS "status: ServiceStatus", reason, triggered_at, resolved_at
         "#,
-            alert.alert_point_id,
-            alert.alert_type as AlertType,
-            alert.reason,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_unique_violation)
-    }
+        alert.alert_point_id,
+        alert.alert_type as AlertType,
+        alert.status as ServiceStatus,
+        alert.reason,
+    )
+    .fetch_one(pool)
+    .await
+}
 
     /// Resolve all open alerts of an alert point (`Remove` lifecycle event).
     /// Returns the number of resolved rows.
@@ -79,21 +39,27 @@ impl ActiveAlertStore for PgActiveAlertStore {
         Ok(result.rows_affected())
     }
 
-    /// All currently open alerts, newest first (initial WS state sync source).
-    async fn list_open(&self) -> Result<Vec<ActiveAlert>, RepoError> {
-        sqlx::query_as!(
-            ActiveAlert,
-            r#"
+/// All currently open alerts with their targets' metadata, newest first.
+/// This is the source for the WebSocket snapshot-on-connect (task 2.4).
+pub async fn list_open_with_point(pool: &PgPool) -> Result<Vec<OpenAlertWithPoint>, sqlx::Error> {
+    sqlx::query_as!(
+        OpenAlertWithPoint,
+        r#"
         SELECT
-            id,
-            alert_point_id,
-            alert_type AS "alert_type: AlertType",
-            reason,
-            triggered_at,
-            resolved_at
-        FROM active_alerts
-        WHERE resolved_at IS NULL
-        ORDER BY triggered_at DESC, id DESC
+            a.id,
+            a.alert_point_id,
+            a.alert_type AS "alert_type: AlertType",
+            a.status AS "status: ServiceStatus",
+            a.reason,
+            a.triggered_at,
+            p.name,
+            p.url,
+            p.service_type AS "service_type: ServiceType",
+            p.expected_response_time_ms
+        FROM active_alerts a
+        JOIN alert_points p ON p.id = a.alert_point_id
+        WHERE a.resolved_at IS NULL
+        ORDER BY a.triggered_at DESC, a.id DESC
         "#,
         )
         .fetch_all(&self.pool)
@@ -101,18 +67,43 @@ impl ActiveAlertStore for PgActiveAlertStore {
         .map_err(RepoError::from_sqlx)
     }
 
-    /// The open alert of a single alert point, if any.
-    async fn latest_open(&self, alert_point_id: Uuid) -> Result<Option<ActiveAlert>, RepoError> {
-        sqlx::query_as!(
-            ActiveAlert,
-            r#"
-        SELECT
-            id,
-            alert_point_id,
-            alert_type AS "alert_type: AlertType",
-            reason,
-            triggered_at,
-            resolved_at
+/// Update the open alert of an alert point (`Update` lifecycle event):
+/// replaces type, status and reason, keeping `triggered_at`. Returns the
+/// updated row or `None` if the alert was resolved concurrently (the worker
+/// then simply proceeds without publishing an update).
+pub async fn update_open(
+    pool: &PgPool,
+    alert_point_id: Uuid,
+    alert_type: AlertType,
+    status: ServiceStatus,
+    reason: String,
+) -> Result<Option<ActiveAlert>, sqlx::Error> {
+    sqlx::query_as!(
+        ActiveAlert,
+        r#"
+        UPDATE active_alerts
+        SET alert_type = $2, status = $3, reason = $4
+        WHERE alert_point_id = $1 AND resolved_at IS NULL
+        RETURNING id, alert_point_id, alert_type AS "alert_type: AlertType", status AS "status: ServiceStatus", reason, triggered_at, resolved_at
+        "#,
+        alert_point_id,
+        alert_type as AlertType,
+        status as ServiceStatus,
+        reason,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// The open alert of a single alert point, if any.
+pub async fn latest_open(
+    pool: &PgPool,
+    alert_point_id: Uuid,
+) -> Result<Option<ActiveAlert>, sqlx::Error> {
+    sqlx::query_as!(
+        ActiveAlert,
+        r#"
+        SELECT id, alert_point_id, alert_type AS "alert_type: AlertType", status AS "status: ServiceStatus", reason, triggered_at, resolved_at
         FROM active_alerts
         WHERE alert_point_id = $1 AND resolved_at IS NULL
         ORDER BY triggered_at DESC, id DESC

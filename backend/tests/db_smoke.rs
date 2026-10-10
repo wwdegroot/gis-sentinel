@@ -6,6 +6,8 @@
 //! in-memory fakes' semantics (see `docs/tests.md`).
 
 use backend::db;
+use backend::db::models::AlertType as DbAlertType;
+use backend::db::models::ServiceStatus as DbServiceStatus;
 use backend::db::models::{
     HttpMethod, NewActiveAlert, NewAlertPoint, NewProbeResult, ServiceType, UpdateAlertPoint,
 };
@@ -45,7 +47,9 @@ async fn repository_layer_round_trip() {
     // read back
     let fetched = alert_points.get(point.id).await.unwrap();
     assert_eq!(fetched.name, "smoke-test");
-    let list = alert_points.list(true, 10, 0).await.unwrap();
+    let list = repo::alert_points::list(&pool, true, None, 10, 0)
+        .await
+        .unwrap();
     assert!(list.iter().any(|p| p.id == point.id));
 
     // partial update incl. setting auth_config from NULL to a value
@@ -85,7 +89,8 @@ async fn repository_layer_round_trip() {
     active_alerts
         .insert(NewActiveAlert {
             alert_point_id: point.id,
-            alert_type: backend::db::AlertType::New,
+            alert_type: DbAlertType::New,
+            status: DbServiceStatus::Down,
             reason: "unreachable".to_string(),
         })
         .await
@@ -93,7 +98,8 @@ async fn repository_layer_round_trip() {
     let dup = active_alerts
         .insert(NewActiveAlert {
             alert_point_id: point.id,
-            alert_type: backend::db::AlertType::Update,
+            alert_type: DbAlertType::Update,
+            status: DbServiceStatus::Degraded,
             reason: "degraded".to_string(),
         })
         .await;
@@ -101,10 +107,42 @@ async fn repository_layer_round_trip() {
         matches!(dup, Err(backend::db::repo::RepoError::Conflict)),
         "expected conflict for second open alert"
     );
-    let open = active_alerts.list_open().await.unwrap();
+    let open = repo::active_alerts::list_open_with_point(&pool)
+        .await
+        .unwrap();
     assert_eq!(open.len(), 1);
-    let resolved = active_alerts.resolve(point.id).await.unwrap();
+    assert_eq!(open[0].status, DbServiceStatus::Down);
+    assert_eq!(open[0].name, "smoke-test");
+    let resolved = repo::active_alerts::resolve(&pool, point.id).await.unwrap();
     assert_eq!(resolved, 1);
+
+    // failed-probe queries backing the incidents endpoint + slim history
+    let failed = repo::probe_results::insert(
+        &pool,
+        NewProbeResult {
+            alert_point_id: point.id,
+            response_time_ms: None,
+            status_code: Some(503),
+            is_up: false,
+            error_message: Some("service unavailable".to_string()),
+            raw_response_snippet: Some("<html>oops</html>".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!failed.is_up);
+    let incidents = repo::probe_results::list_failed_since(&pool, point.id, 24, 100)
+        .await
+        .unwrap();
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].status_code, Some(503));
+    assert_eq!(incidents[0].error_message.as_deref(), Some("service unavailable"));
+    // slim history points carry no error detail
+    let history = repo::probe_results::list_since(&pool, point.id, 24, 100)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|p| p.response_time_ms.is_some() || !p.is_up));
 
     // cascade cleanup
     assert!(alert_points.delete(point.id).await.unwrap());
@@ -115,6 +153,8 @@ async fn repository_layer_round_trip() {
     // probe results and alerts must have cascaded
     let recent = probe_results.list_recent(point.id, 5).await.unwrap();
     assert!(recent.is_empty());
-    let open = active_alerts.list_open().await.unwrap();
+    let open = repo::active_alerts::list_open_with_point(&pool)
+        .await
+        .unwrap();
     assert!(open.iter().all(|a| a.alert_point_id != point.id));
 }

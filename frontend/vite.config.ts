@@ -13,7 +13,10 @@ export default defineConfig({
         proxy: {
             '/ws': {
                 target: `http://127.0.0.1:${process.env.BACKEND_PORT ?? 3000}`,
-                ws: true
+                ws: true,
+                // the backend does not check Origin, but some proxies fail
+                // upgrades without a rewritten Host/Origin
+                rewriteWsOrigin: true
             },
             '/api': {
                 target: `http://127.0.0.1:${process.env.BACKEND_PORT ?? 3000}`

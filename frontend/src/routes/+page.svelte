@@ -1,107 +1,114 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte';
+    import { sentinel } from '$lib/sentinelSocket.svelte';
+    import type { ServiceStatus, ServiceType } from '$lib/types';
+    import AlertCard from '$lib/components/AlertCard.svelte';
+    import AlertsEmpty from '$lib/components/AlertsEmpty.svelte';
+    import SummaryStats from '$lib/components/SummaryStats.svelte';
 
-    let socket: WebSocket;
+    // Live filters (client-side over the socket state, per plan §3.2).
+    let statusFilter: 'all' | ServiceStatus = $state('all');
+    let typeFilter: 'all' | ServiceType = $state('all');
+    let search = $state('');
 
-    let messages: string[] = $state([]);
+    const serviceTypes: ServiceType[] = ['WMS', 'WFS', 'WMTS', 'OAF', 'ArcGIS_REST', 'HTTP'];
 
-    let timeoutID: ReturnType<typeof setTimeout> | undefined;
-    let start: boolean = $state(false);
-    let textMessage: string = $state('');
+    const severity: Record<ServiceStatus, number> = { down: 0, degraded: 1, healthy: 2 };
 
-    function startMessaging() {
-        start = true;
-        socket = new WebSocket(`ws://${location.host}/ws`);
-        socket.addEventListener('open', function (event) {
-            socket.send('Hello Server!');
-        });
+    const filtered = $derived(
+        [...sentinel.alerts]
+            .filter((a) => statusFilter === 'all' || a.status === statusFilter)
+            .filter((a) => typeFilter === 'all' || a.service_type === typeFilter)
+            .filter((a) => {
+                const q = search.trim().toLowerCase();
+                return (
+                    q === '' || a.name.toLowerCase().includes(q) || a.url.toLowerCase().includes(q)
+                );
+            })
+            .sort(
+                (a, b) =>
+                    severity[a.status] - severity[b.status] ||
+                    Date.parse(b.triggered_at) - Date.parse(a.triggered_at)
+            )
+    );
 
-        socket.addEventListener('message', function (event) {
-            messages.push(`Message from server: ${event.data}`);
-        });
-
-        socket.addEventListener('close', function (event) {
-            messages.push(`Closing websocket: ${event.reason}`);
-            start = false;
-        });
-        timeoutID = setTimeout(() => {
-            const obj = { hello: 'world' };
-            const blob = new Blob([JSON.stringify(obj, null, 2)], {
-                type: 'application/json'
-            });
-            socket.send(blob);
-        }, 1000);
-    }
-
-    function stopMessaging() {
-        clearTimeout(timeoutID);
-        start = false;
-        socket.close(3000, 'Crash and Burn!');
-    }
-
-    function clearMessages() {
-        messages = [];
-    }
-
-    function sentMessage() {
-        if (socket) {
-            // const obj = { message: textMessage };
-            // const blob = new Blob([JSON.stringify(obj, null, 2)], {
-            //     type: "application/json",
-            // });
-            socket.send(textMessage);
-            textMessage = '';
-        } else {
-            messages.push('WebSocket is closed');
-        }
-    }
-
-    onMount(() => {});
-
-    onDestroy(() => {
-        if (socket) {
-            socket.close();
-        }
-    });
+    const hasFilters = $derived(
+        statusFilter !== 'all' || typeFilter !== 'all' || search.trim() !== ''
+    );
 </script>
 
-<div class="container mx-auto">
-    <div class="mt-4 flex flex-row gap-2 max-h-2/4">
-        <div class="flex flex-col gap-2 min-w-20">
-            <div>
-                Connection: {#if start}🟢{:else}🔴{/if}
-            </div>
-            <div>
-                <button
-                    class="bg-lime-300 rounded-md p-2 text-lime-700 font-bold min-w-16"
-                    onclick={() => startMessaging()}>Start</button
-                >
-            </div>
-            <div>
-                <button
-                    class="bg-red-300 rounded-md p-2 text-red-700 font-bold min-w-16"
-                    onclick={() => stopMessaging()}>Stop</button
-                >
-            </div>
-            <div>
-                <button
-                    class="bg-violet-300 rounded-md p-2 text-violet-700 font-bold min-w-16"
-                    onclick={() => clearMessages()}>Clear</button
-                >
-            </div>
+<svelte:head>
+    <title>GIS Sentinel — Dashboard</title>
+</svelte:head>
+
+<div class="flex flex-col gap-6">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+        <h1 class="text-2xl font-bold">Live monitoring</h1>
+        <div class="text-xs text-muted">
+            {sentinel.alerts.length}
+            open alert{sentinel.alerts.length === 1 ? '' : 's'} · updates arrive in real time
         </div>
-        <div class="bg-slate-700 rounded-md p-2 min-w-96 max-h-96 overflow-y-auto">
-            {#each messages.slice().reverse() as message}
-                <hr />
-                <div class="text-white">{message}</div>
+    </div>
+
+    <SummaryStats alerts={sentinel.alerts} />
+
+    <div class="flex flex-wrap items-center gap-2">
+        <select
+            bind:value={statusFilter}
+            aria-label="Filter by status"
+            class="rounded-md border border-line bg-surface px-2 py-1.5 text-sm"
+        >
+            <option value="all">All statuses</option>
+            <option value="down">Down</option>
+            <option value="degraded">Degraded</option>
+        </select>
+
+        <select
+            bind:value={typeFilter}
+            aria-label="Filter by service type"
+            class="rounded-md border border-line bg-surface px-2 py-1.5 text-sm"
+        >
+            <option value="all">All service types</option>
+            {#each serviceTypes as type (type)}
+                <option value={type}>{type.replace(/_/g, ' ')}</option>
+            {/each}
+        </select>
+
+        <input
+            type="search"
+            placeholder="Search name or URL…"
+            bind:value={search}
+            aria-label="Search alerts"
+            class="min-w-48 flex-1 rounded-md border border-line bg-surface px-3 py-1.5 text-sm placeholder:text-muted"
+        />
+
+        {#if hasFilters}
+            <button
+                type="button"
+                onclick={() => {
+                    statusFilter = 'all';
+                    typeFilter = 'all';
+                    search = '';
+                }}
+                class="rounded-md border border-line px-3 py-1.5 text-sm text-muted hover:text-text"
+            >
+                Clear filters
+            </button>
+        {/if}
+    </div>
+
+    {#if sentinel.alerts.length === 0}
+        <AlertsEmpty loading={sentinel.connection !== 'connected'} />
+    {:else if filtered.length === 0}
+        <div
+            class="rounded-lg border border-dashed border-line bg-surface-2 p-10 text-center text-sm text-muted"
+        >
+            No alerts match the current filters.
+        </div>
+    {:else}
+        <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {#each filtered as alert (alert.alert_id)}
+                <AlertCard {alert} />
             {/each}
         </div>
-    </div>
-    <div class="flex flex-row gap-2 mt-4">
-        <textarea class="border-2" rows="4" cols="58" bind:value={textMessage}></textarea>
-        <button
-            class="bg-orange-300 rounded-md p-2 text-orange-700 font-bold min-w-16"
-            onclick={() => sentMessage()}>Sent</button
-        >
-    </div>
+    {/if}
 </div>

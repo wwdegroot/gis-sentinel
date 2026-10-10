@@ -1,479 +1,457 @@
-# Phase 2 — Backend Services Implementation (Plans & Implementation Reports)
+# Phase 2 — Backend Services Implementation (Change Plan)
 
-Covers `tasks.md` → Phase 2.
+Covers `tasks.md` → Phase 2: **2.1 API Service (Alert Points CRUD)** · **2.2 Scheduler (Queue Producer)** · **2.3 Worker (Probe Executor & Evaluator)** · **2.4 WebSocket & Real-time Alert Hub** · **2.5 Technical Debt & Fixes**
 
-| Part | Task | Status |
-|---|---|---|
-| Part 1 | 2.1 API Service (Alert Points CRUD) | ✅ **Implemented** (report in Part 1 §10) |
-| Part 2 | 2.2 Scheduler (Queue Producer) | 📝 **PLANNED** — see Part 2 |
-| Part 3 | 2.3 Worker (Probe Executor & Evaluator) | 📝 **PLANNED** — see Part 3 |
-| Part 4 | 2.4 WebSocket & Real-time Alert Hub | 📝 **PLANNED** — see Part 4 |
-| Part 5 | 2.5 Backend Technical Debt | 📝 **PLANNED** — see Part 5 |
-
-Testing infrastructure already exists from `docs/tests.md`: repository/queue
-class traits + in-memory fakes (`test-utils` feature), so scheduler/worker/hub
-logic is testable without live services; live-service coverage sits behind the
-`smoke-tests` feature.
+Status: ✅ **PHASE 2 COMPLETE** — 2.1–2.5 all implemented & live-verified. Remaining Phase-2 follow-ups are tracked as Phase-3/4 dependencies (frontend `processMessage` update, multi-instance fan-out via Redis Pub/Sub).
 
 ---
 
-## Part 1 — Task 2.1 API Service (Alert Points CRUD)
+## 0. Current State (what Phase 2 builds on)
 
-Status: ✅ **IMPLEMENTED** — see report in section 10.
+Already in place from Phase 1 — Phase 2 work plugs into these:
 
-### 0. Key Decisions (confirmed)
-
-| # | Question | Options | Decision |
-|---|----------|---------|----------|
-| Q1 | Scope of phase2.md / this step | a) backend API only, b) also build the frontend `/services` page (task 3.4) | **a) backend only** — frontend arrives with Phase 3 |
-| Q2 | Payload validation approach | a) `validator` crate with derive rules, b) hand-rolled `validate()` functions | **a) `validator` crate (derive)** |
-| Q3 | `POST /:id/test` behavior while no worker exists (task 2.3) | a) synchronously probe now, b) enqueue a `ProbeJob` (consumed later by 2.3), c) enqueue + 202 | **b) enqueue a `ProbeJob`** onto the Valkey queue via existing `queue::enqueue_probe_job`; returns `202 Accepted` with the enqueued job echo |
-| Q4 | `PUT /:id` semantics | a) partial update (only provided fields change), b) strict full replacement | **a) partial update** — matches the already-implemented `repo::alert_points::update()` `COALESCE` design |
-| Q5 | Error-handling crates | a) hand-rolled `ApiError` enum, b) `thiserror` (typed derive-based errors), c) `anyhow` (type-erased) | **b + c, each in its natural habitat**: `thiserror` for all *typed* error enums — the new `ApiError` and a refactor of the existing hand-rolled `QueueError` (variant matching drives 404-vs-400-vs-503 mapping; `?` + `From` impls remove handler boilerplate). `anyhow` for *application* bootstrap in `main.rs` (replaces the `panic!`/`unwrap` chains; type erasure is fine where the process just exits). `anyhow` is **not** used in library/route code: it erases the concrete type, making status-code routing impossible |
-
-Additional assumptions (documented, not blocking):
-
-- **Probe timeout source**: `alert_points` has no `timeout` column, but `ProbeJob.timeout_ms` requires one. Use a constant default of **10 000 ms** for now (module-level `const DEFAULT_PROBE_TIMEOUT_MS: i64`); making it configurable is deferred until task 2.3 needs it.
-- **Mock data stays**: the demo `active_alerts` in `main.rs` and legacy `ws_handler` are cleaned up in task 2.4, not here.
-
-### 1. Dependencies (`backend/Cargo.toml`)
-
-```toml
-validator = { version = "0.19", features = ["derive"] }
-thiserror = "2"
-anyhow = "1"
-```
-
-(`serde`, `serde_json`, `uuid`, `chrono`, `sqlx`, `axum` already present from Phase 1; `tracing` already present for logging swallowed `500`-cause errors.)
-
-### 1.1 Error-Handling Refactor (existing code)
-
-Two existing error surfaces get modernized *before* the API is built on top of them:
-
-**a) `QueueError` → `thiserror` derive (`src/queue/mod.rs`)**
-
-Replace the ~35 lines of manual `Display`, `std::error::Error`, and `From` impls (lines 32–65) with:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum QueueError {
-    #[error("redis queue error: {0}")]
-    Pool(#[from] deadpool_redis::PoolError),
-    #[error("invalid job payload: {0}")]
-    Serde(#[from] serde_json::Error),
-}
-
-// Keep manual: thiserror cannot do transitive From (RedisError -> PoolError -> QueueError).
-impl From<redis::RedisError> for QueueError {
-    fn from(e: redis::RedisError) -> Self {
-        QueueError::Pool(e.into())
-    }
-}
-```
-
-- Behavior-preserving: same variant names, same `Display` messages → `tests/queue_smoke.rs` compiles unchanged.
-- Improvement over the current code: `#[from]` wires proper `source()` chaining (the current `impl std::error::Error for QueueError {}` drops the inner cause), which `ApiError::QueueUnavailable(#[source] QueueError)` and `tracing::error!` logging rely on later.
-- Public API of the queue module unchanged; all `Result<_, QueueError>` signatures stay.
-
-**b) `main.rs` bootstrap → `anyhow`**
-
-Replace the five `unwrap_or_else(|e| panic!(...))` / `.unwrap()` chains (config load, DB connect, migrations, redis pool, serve) with:
-
-```rust
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config = Config::from_env()
-        .context("invalid configuration")?;
-    let db_pool = db::connect(&config.database_url)
-        .await
-        .context("could not connect to database")?;
-    db::run_migrations(&db_pool).await.context("database migrations failed")?;
-    // ...
-    axum::serve(listener, app).await.context("server error")?;
-    Ok(())
-}
-```
-
-- Same failure behavior as today (process exits with an error), but anyhow prints a clean `Error: <msg>` with the full cause chain instead of a panic backtrace.
-- Scope guard: `anyhow` is used **only** in `main.rs`; all `src/` modules and handlers keep typed errors.
-
-After code changes: refresh the offline query cache with `cargo sqlx prepare` (run from `backend/`, `DATABASE_URL` pointing at `postgres-gs:5432`, `SQLX_OFFLINE=true` keeps builds reproducible).
-
-### 2. API Surface — REST routes under `/api/v1/alert-points`
-
-| Method | Path | Success | Errors | Description |
-|---|---|---|---|---|
-| `GET` | `/api/v1/alert-points` | `200` + page envelope | `400` (bad query params) | List with filtering & pagination |
-| `POST` | `/api/v1/alert-points` | `201` + created `AlertPoint` | `400`/`422` (validation) | Create a monitoring point |
-| `GET` | `/api/v1/alert-points/:id` | `200` + detail w/ history | `404` | Details + recent probe history |
-| `PUT` | `/api/v1/alert-points/:id` | `200` + updated `AlertPoint` | `400`/`422`, `404` | Partial update of settings |
-| `DELETE` | `/api/v1/alert-points/:id` | `204` no content | `404` | Delete (probe history cascades) |
-| `POST` | `/api/v1/alert-points/:id/test` | `202` + `{ queued: true, job }` | `404`, `503` (queue down) | On-demand probe: enqueue `ProbeJob` |
-
-Note: `422` is returned by the `Json` extractor itself for bodies that fail deserialization (e.g. unknown `service_type`); `400` is returned for structurally valid bodies that fail `validator` rules.
-
-### 3. New Module Layout
-
-```
-backend/src/
-├── api/
-│   ├── mod.rs          # api_router(state) -> Router<AppState>, error type, pagination types
-│   └── alert_points.rs # route handlers for the six endpoints
-├── handlers/mod.rs     # unchanged this step (ws + static handlers stay)
-```
-
-`main.rs` mounts the API via `.nest("/api/v1", api::api_router(...))` (or `.merge` with full paths) alongside the existing `/ws` routes and static fallback.
-
-**AppState changes**: `db: PgPool` and `redis: RedisPool` become `pub(crate)` (currently `#[allow(dead_code)]` private) so API handlers can use them. The mock `active_alerts`/broadcast fields remain untouched (cleanup = 2.4).
-
-### 4. Request / Response Contracts
-
-New DTOs in `backend/src/api/alert_points.rs` (or a small `api/dto.rs`), reusing the DB enums `ServiceType` / `HttpMethod` from `db::models` (serde already serializes them as `WMS`, `WFS`, ..., `ArcGIS_REST`, `HTTP`, `GET`, `POST` — the wire contract from `tasks.md`):
-
-**`POST /api/v1/alert-points` request** — `CreateAlertPointRequest` (wraps/mirrors `db::models::NewAlertPoint` plus validation attributes):
-
-| Field | Type | Validation |
+| Building block | Location | Notes |
 |---|---|---|
-| `name` | `String` | `length(1..=200)`, trimmed non-empty |
-| `url` | `String` | valid `http`/`https` URL (validator `url` + scheme check) |
-| `service_type` | `ServiceType` | deserialization rejects unknown values |
-| `check_interval_seconds` | `i32` | `range(1..=86_400)` |
-| `expected_response_time_ms` | `i32` | `range(1..=600_000)` |
-| `http_method` | `HttpMethod` | optional, default `GET` |
-| `custom_headers` | `Value` | optional, default `{}`; must be a JSON **object** whose values are strings |
-| `auth_config` | `Option<Value>` | optional, if present must be a JSON object |
-| `enabled` | `bool` | optional, default `true` |
+| DB schema (migrations) | `backend/migrations/0001_initial_schema.sql` | `alert_points` (UUID v7 PK), `probe_results` (BIGINT identity), `active_alerts` (partial unique index: at most one open alert per point) |
+| Models | `backend/src/db/models.rs` | `AlertPoint`, `NewAlertPoint`, `UpdateAlertPoint`, `ProbeResult`, `NewProbeResult`, `ActiveAlert`, `NewActiveAlert`, `ServiceType`, `HttpMethod`, `AlertType` |
+| Repository layer | `backend/src/db/repo/{alert_points,probe_results,active_alerts}.rs` | CRUD + `list_recent`, `uptime_percentage`, `insert`/`resolve`/`list_open`/`latest_open` for alerts — **all already compile-time checked with `.sqlx` offline cache** |
+| Queue layer | `backend/src/queue/mod.rs` | `ProbeJob` wire contract (`target_id`, `url`, `service_type`, `expected_time_ms`, `timeout_ms`), `enqueue_probe_job` (LPUSH), `dequeue_probe_job` (BRPOP), in-flight gate (`try_acquire_inflight`/`release_inflight`), `ALERTS_PUBSUB_CHANNEL = "sentinel:alerts"`, deadpool pool + health check |
+| Config | `backend/src/config.rs` | typed `Config` via env: `APP_HOST`, `APP_PORT`, `APP_CORS_ORIGINS`, `FRONTEND_BUILD_DIR`, `DATABASE_URL`, `REDIS_URL`, `LOG_LEVEL` |
+| `AppState` | `backend/src/main.rs` | holds `broadcast_tx: Arc<Sender<Message>>`, `active_alerts: Arc<RwLock<Vec<SentinelAlert>>>` (demo), `db: PgPool`, `redis: RedisPool`, `shutdown_token: CancellationToken` |
+| WebSocket handlers | `backend/src/handlers/sentinel_ws.rs` | ✅ task 2.4: snapshot-on-connect + live `WsMessage` events |
+| Real-time pipeline | `backend/src/{workers,ws_protocol}` | ✅ tasks 2.2–2.4: scheduler → queue → probe worker → `AlertEvent` broadcast; demo code removed |
 
-**`PUT /api/v1/alert-points/:id` request** — `UpdateAlertPointRequest` (mirrors `db::models::UpdateAlertPoint`): all fields `Option`; validation applies **only to `Some` values** (validator `#[validation(...)]` on nested Option fields or manual cross-checks in a `validate_partial` helper). `auth_config` keeps the `Option<Option<Value>>` three-state convention already implemented in the repo layer (absent = unchanged, `null` = cleared, value = set).
+**Key gaps to close:** REST API routes, scheduler, probe worker, real alert evaluation, real WS data source, graceful shutdown, tracing IDs. **`reqwest` is not yet a dependency** and must be added.
 
-**`GET /api/v1/alert-points` query parameters** (`ListAlertPointsQuery`):
+---
 
-| Param | Type | Default | Notes |
+## 1. Dependencies (`backend/Cargo.toml`)
+
+| Crate | Version | Why | Task |
 |---|---|---|---|
-| `page` | `u32` | `1` | 1-based |
-| `page_size` | `u32` | `20` | clamped to `1..=100` |
-| `enabled` | `Option<bool>` | — | filter on `enabled` |
-| `service_type` | `Option<ServiceType>` | — | filter on type |
-| `search` | `Option<String>` | — | case-insensitive `ILIKE` on `name`/`url` |
+| `reqwest` | `0.12`, features `["json", "rustls-tls"]`, `default-features = false` | GIS probe HTTP client (task 2.3). Reuse `rustls` already pulled in by sqlx. | 2.3 |
+| `validator` (optional) | `0.19`, feature `["derive"]` | declarative payload validation; alternatively hand-rolled `validate()` methods — decide at implementation time | 2.1 |
+| `quick-xml` (optional) | `0.37` | `GetCapabilities` XML parsing for WMS/WFS service-level checks | 2.3 |
+| `serde` / `serde_json` | already present | wire contracts | — |
 
-**`200` response envelope**:
+New dev-dependencies: `wiremock` or `httpmock` for probe-client tests (feeds task 5.1).
 
-```json
-{
-  "data": [ AlertPoint... ],
-  "pagination": { "page": 1, "page_size": 20, "total": 42, "total_pages": 3 }
-}
+After adding/removing any `query!` macro inputs: re-run `cargo sqlx prepare` (`SQLX_OFFLINE=true` build must stay green).
+
+---
+
+## 2. Task 2.1 — API Service (Alert Points CRUD) ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):** built as planned below, with these deviations:
+> - axum 0.8 path syntax is `/{id}` (not `/:id`).
+> - **GET/POST only** per decision — update and delete are POST sub-actions
+>   (`POST /{id}/update`, `POST /{id}/delete`), not `PUT`/`DELETE`.
+> - Nested router at `/api/v1/alert-points` does **not** match a trailing slash — that falls through to the SPA fallback by design (axum `nest` semantics).
+> - Create endpoint takes the `NewAlertPoint` model directly (serde defaults); the update endpoint uses an all-optional payload and rejects no-op bodies with 400.
+> - Header-name validation lowercases input so `X-Api-Key` is accepted.
+> - New repo queries: `alert_points::list(..., Option<ServiceType>, ...)` and `alert_points::count(...)` — `.sqlx` cache regenerated (14 queries).
+> - Installed `sqlx-cli 0.8.6` (`~/.cargo/bin`); created `backend/.env` pointing at `postgres-gs`.
+> - Live smoke test passed: create / 422-validation / filter+pagination / detail / partial-update / on-demand probe (real 403 captured with latency + snippet) / 404 / delete-cascade.
+
+### 2.1.1 New module layout
+
+```
+backend/src/handlers/
+├── mod.rs            # add `pub mod alert_points_api;`
+└── alert_points_api.rs   # NEW — all REST handlers + router fn
 ```
 
-**`GET /api/v1/alert-points/:id` response** — `AlertPointDetail`:
-
-```json
-{
-  "alert_point": { ...AlertPoint... },
-  "recent_results": [ ...last 20 probe_results, newest first... ],
-  "uptime_24h_pct": 99.5,          // null if no results
-  "open_alert": { ...ActiveAlert... } // null if none
-}
-```
-
-**Error envelope** (all endpoints), via an `ApiError` enum defined with `#[derive(Debug, thiserror::Error)]` and implementing `IntoResponse`:
+### 2.1.2 Routes (mount in `main.rs`)
 
 ```rust
-#[derive(Debug, thiserror::Error)]
-pub enum ApiError {
-    #[error("validation failed")]
-    Validation(HashMap<String, Vec<String>>),   // -> 400 + field details
-    #[error("{0}")]
-    BadRequest(String),                         // -> 400
-    #[error("resource not found")]
-    NotFound,                                   // -> 404
-    #[error("database error")]
-    Database(#[from] sqlx::Error),              // -> 500 (cause logged, not leaked)
-    #[error("queue unavailable")]
-    QueueUnavailable(#[source] QueueError),     // -> 503
-}
+let app = Router::new()
+    .fallback(static_handler)
+    .route("/healthz", get(healthz))              // see 2.5
+    .route("/ws", get(ws_handler))                 // removed in 2.4
+    .route("/ws/sentinel", get(ws_sentinel_handler))
+    .nest("/api/v1/alert-points", alert_points_api::router())
+    ...
 ```
 
-- `#[from] sqlx::Error` lets handlers use `repo::get(...)?` directly; `IntoResponse` inspects the sqlx error kind to translate `RowNotFound` into `404` where appropriate.
-- `IntoResponse` renders every variant into the uniform JSON envelope below; `500`/`503` variants log the source chain with `tracing::error!` while responding with a generic message (no internals leaked).
-- The hand-written error envelope remains:
+`alert_points_api::router()` returns:
 
-```json
-{ "error": { "code": "validation", "message": "...", "details": { "field": ["msg"] } } }
-```
+| Method & path | Handler | Repo fn used | Notes |
+|---|---|---|---|
+| `GET /api/v1/alert-points` | `list_alert_points` | `alert_points::list` + `alert_points::count` | query params: `?enabled=true/false`, `?service_type=WMS`, `?page=1&per_page=50` (map to `limit`/`offset`; `per_page` capped, e.g. max 200) |
+| `POST /api/v1/alert-points` | `create_alert_point` | `alert_points::create` | 201 + created `AlertPoint`; 422 on validation failure |
+| `GET /api/v1/alert-points/{id}` | `get_alert_point` | `alert_points::get` + `probe_results::list_recent(id, 50)` | returns `{ alert_point, recent_probes }`; 404 when missing |
+| `POST /api/v1/alert-points/{id}/update` | `update_alert_point` | `alert_points::update` | partial update semantics; 404 when missing |
+| `POST /api/v1/alert-points/{id}/delete` | `delete_alert_point` | `alert_points::delete` | 204; 404 when rows affected = 0. Probe results & alerts cascade (FK `ON DELETE CASCADE`) |
+| `POST /api/v1/alert-points/{id}/test` | `test_alert_point` | `alert_points::get` + probe client | runs one probe **synchronously** (with timeout) and returns the would-be `ProbeResult`; does NOT persist, does NOT alert — read-only diagnostic |
 
-### 5. Repository Additions (`db/repo/alert_points.rs`, `db/repo/active_alerts.rs`)
+> **API style decision:** GET and POST only. State changes are expressed as POST
+> sub-actions (`/{id}/update`, `/{id}/delete`, `/{id}/test`) instead of `PUT`/`DELETE` —
+> simpler proxies/CORS and no method-based routing edge cases.
 
-- `list_filtered(pool, filter: ListFilter { enabled: Option<bool>, service_type: Option<ServiceType>, search: Option<String>, limit: i64, offset: i64 }) -> Vec<AlertPoint>` — dynamic `WHERE` via compile-time-checked query with `COALESCE`-style optional params (keeps `SQLX_OFFLINE` compatible; no query-building DSL needed).
-- `count_filtered(pool, same filter minus limit/offset) -> i64` — for the pagination envelope.
-- Existing `create` / `get` / `update` / `delete` are reused as-is.
-- `active_alerts` repo: add `get_open_for_point(pool, alert_point_id) -> Option<ActiveAlert>` (SELECT ... `WHERE alert_point_id = $1 AND resolved_at IS NULL`) for the detail endpoint.
-- `probe_results::list_recent` and `uptime_percentage` already exist and are reused.
+### 2.1.3 Validation rules (`validate_new` / `validate_update` on the models, or a new `backend/src/handlers/validation.rs`)
 
-### 6. Handler Logic
+- `url`: absolute `http`/`https` URL (`url::Url::parse` — add `url` crate, already in tree via reqwest), no credentials in URL.
+- `check_interval_seconds`: `> 0` (DB CHECK also enforces); sensible floor, e.g. `>= 10`.
+- `expected_response_time_ms`: `> 0`.
+- `service_type`: deserialization of `ServiceType` already rejects unknown values → maps to 422.
+- `http_method`: GET/POST only (already enum-constrained).
+- `custom_headers`: must be a JSON object; reject hop-by-hop headers (`Host`, `Content-Length`, `Connection`, ...).
+- `auth_config`: if present, must match a known shape (see 2.3.4).
+- `UpdateAlertPoint`: at least one field set (`None`-everything → 400).
 
-- **create**: `Json<CreateAlertPointRequest>` → `.validate()` → map to `NewAlertPoint` → `repo::create` → `201`.
-- **list**: `Query<ListAlertPointsQuery>` (validated/clamped) → `list_filtered` + `count_filtered` → envelope.
-- **get**: `Path<Uuid>` → `repo::get` → join in recent results, uptime, open alert → `AlertPointDetail`.
-- **update**: `Path` + `Json<UpdateAlertPointRequest>` → validate `Some` fields → `repo::update` → `200`; `RowNotFound` → `404`.
-- **delete**: `repo::delete` → `204` if `true`, `404` if `false`.
-- **test**: `repo::get` → build `ProbeJob { target_id: id, url, service_type, expected_time_ms, timeout_ms: DEFAULT_PROBE_TIMEOUT_MS }` → `queue::enqueue_probe_job(&state.redis, &job)` → `202 { "queued": true, "job": {...} }`; queue pool errors flow through `ApiError::QueueUnavailable` → `503 QueueUnavailable` (per Phase 1 the server tolerates Valkey being down at boot).
-- **Handler ergonomics**: with `thiserror` `From` impls in place, handler bodies return `Result<impl IntoResponse, ApiError>` and propagate with `?` — no manual `match` on repo/queue results except for intentional translations (e.g. `delete` returning `bool` → `NotFound`).
+### 2.1.4 Error handling contract
 
-### 7. Testing
+- Introduce a shared API error type, e.g. `ApiError` in `backend/src/handlers/error.rs` implementing `IntoResponse`:
+  - `400 Bad Request`, `404 Not Found`, `422 Unprocessable Entity` (with field-level messages), `500 Internal` (log full error, return opaque message).
+- `impl From<sqlx::Error> for ApiError` mapping `RowNotFound` → 404.
+- Uniform JSON error body: `{ "error": { "code": "...", "message": "...", "details": ... } }`.
 
-- **Unit tests** (`#[cfg(test)]` in the API module): validation rules for `CreateAlertPointRequest`/`UpdateAlertPointRequest` (bad URL, bad scheme `ftp://`, zero/negative interval, empty name, non-object `custom_headers`, valid full payload), query-param clamping, and pagination math.
-- **Integration tests** (`backend/tests/api_smoke.rs`, pattern of existing `db_smoke.rs`): build the router with a real pool against `postgres-gs`, exercise full CRUD lifecycle + `test` endpoint enqueue (requires Valkey in `valkey-gs`): create → 201, get → 200 with history fields, list with filters/pagination, put → partial update, delete → 204 then get → 404, test → 202 and job visible in `sentinel:probe_jobs` (then clean the queue).
-- **Manual smoke**: `curl` against a locally running backend.
+### 2.1.5 Tests (feeds task 5.1)
 
-### 8. Verification Checklist (definition of done for 2.1)
-
-- [x] `validator` + `thiserror` + `anyhow` dependencies added; all request DTOs carry validation rules
-- [x] `QueueError` refactored to `thiserror` derive, behavior-preserving (`queue_smoke` green); `main.rs` bootstrap on `anyhow::Result` with `.context(...)`, `panic!` chains removed
-- [x] `ApiError` defined via `thiserror` derive; conversions used so handlers propagate with `?`; `500`/`503` sources logged via `tracing` *(deviation: `sqlx::Error` wrapped in `RepoError` per `docs/tests.md` trait refactor)*
-- [x] `GET  /api/v1/alert-points` with `page`, `page_size`, `enabled`, `service_type`, `search` + pagination envelope
-- [x] `POST /api/v1/alert-points` → `201`; invalid payloads → `400` with field-level details; unknown `service_type` → `400 bad_request` *(deviation: serde rejections mapped to uniform `400`, not `422`)*
-- [x] `GET  /api/v1/alert-points/:id` → detail incl. recent probe history, uptime %, open alert; unknown id → `404`
-- [x] `PUT  /api/v1/alert-points/:id` → partial update; absent fields unchanged; `auth_config` 3-state works
-- [x] `DELETE /api/v1/alert-points/:id` → `204`; cascades verified; unknown id → `404`
-- [x] `POST /api/v1/alert-points/:id/test` → `202`, `ProbeJob` verifiable in the queue *(live Redis check = smoke test; unit-verified via `FakeProbeQueue`)*
-- [x] Uniform JSON error envelope for all error paths
-- [x] Handlers reach DB/queue via state *(deviation: `ApiState` holds `Arc<dyn repo/queue traits>` instead of raw pools — enables the mocked tests)*
-- [x] Repo: `list_filtered` + `count_filtered` + `active_alerts::latest_open` *(renamed from `get_open_for_point`)*
-- [x] `cargo sqlx prepare` refresh **not needed** — raw SQL kept byte-identical through the trait refactor, offline cache still valid
-- [x] `cargo build` + `cargo test` green (31 lib + 18 integration tests, zero live services required)
-- [x] `docs/tasks.md` checkbox 2.1 ticked; this file updated from *Planned* → *Implemented* with a report (below)
-
-### 9. Implementation Order
-
-1. **Error-handling refactor**: add `validator` + `thiserror` + `anyhow` deps; convert `QueueError` to `thiserror` derive; convert `main.rs` bootstrap to `anyhow::Result`; verify `queue_smoke` still passes
-2. Create `api/mod.rs` with the `thiserror`-derived `ApiError` (`IntoResponse` impl, source logging, rejection mapping); make `AppState` fields `pub(crate)`
-3. DTOs + validation + unit tests
-4. Repo additions (`list_filtered`, `count_filtered`, `get_open_for_point`) + `cargo sqlx prepare`
-5. Handlers for the six routes + wire router in `main.rs`
-6. Integration test `api_smoke.rs`; run against `postgres-gs` / `valkey-gs`
-7. `cargo build` + full test pass; docs update (`tasks.md` + this file)
-
-### 10. Implementation Report
-
-Implemented per plan with the `docs/tests.md` testing infrastructure. Deviations:
-
-1. **State**: `ApiState` holds `Arc<dyn AlertPointRepository / ProbeResultStore / ActiveAlertStore / ProbeQueue>` instead of raw pools — required for the mocked test suite.
-2. **Errors**: `ApiError::Repository(RepoError)` replaces the planned `From<sqlx::Error>`; `RepoError::NotFound → 404`, `Conflict (second open alert) → 409`, `Db → 500`.
-3. **Validation status codes**: unknown `service_type` is a serde rejection mapped to `400 bad_request` (not `422`) — uniform envelope everywhere.
-4. **Routes**: the `/api/v1` prefix is baked into `api::router()` (single source of truth). An initial drift (routes merged at root) was caught and fixed.
-5. **Tests**: `tests/api_alert_points.rs` (18 tests) runs the full router against in-memory fakes via the `test-utils` feature instead of a live `api_smoke.rs`; live-service semantics remain covered by the feature-gated smoke tests (`smoke-tests`).
-6. **`cargo sqlx prepare`**: not needed — raw SQL strings were preserved byte-identically through the refactor.
-
-Final state: 49 tests green (31 lib + 18 integration), zero live services required for `cargo test`.
+- `backend/tests/api_alert_points.rs`: spin up the `Router` with a test DB (`axum::serve` on ephemeral port or `tower::ServiceExt::oneshot`), cover happy path + validation failures + 404s.
 
 ---
 
-## Part 2 — Task 2.2 Scheduler Service (Queue Producer)
+## 3. Task 2.2 — Scheduler Service (Queue Producer) ✅ IMPLEMENTED
 
-Status: 📝 **PLANNED**
+> **Implementation notes (2026-09-18):** built per plan with `last_checked_at`
+> (Q1-a) in migration `0002_scheduler_state.sql` (partial index on enabled rows).
+> - `workers/scheduler.rs`: 1 s–tick loop (default `SCHEDULER_TICK_SECONDS=5`),
+>   `list_due` → `SET NX EX` gate → `ProbeJob{timeout_ms = PROBE_TIMEOUT_MS_DEFAULT}` →
+>   `LPUSH` → `touch_last_checked`. Gate released on enqueue failure; worker (2.3)
+>   releases on completion.
+> - `AppState` now carries typed `Config` (scheduler knobs).
+> - `.env.example` updated with `SCHEDULER_TICK_SECONDS`, `PROBE_TIMEOUT_MS_DEFAULT`.
+> - Live verification: due query → enqueue (pending 0→1) → "no due targets" while
+>   interval pending (proves `touch_last_checked`) → gate holds until TTL expiry
+>   (40 s) → re-enqueue (pending 2) → SIGINT graceful stop. Queue + DB smoke tests
+>   pass against live Valkey/Postgres.
 
-### Decisions (confirmed)
+### 3.1.1 New module
 
-| # | Question | Decision |
-|---|----------|----------|
-| Q1 | Due-time bookkeeping | **Single tick loop** (`tokio::time::interval`, 1s) + in-memory `next_due` map (`target_id → Instant`). Periodic resync from DB + immediate resync on CRUD changes |
-| Q2 | Duplicate in-flight checks | **Redis lock**: `SET sentinel:inflight:{target_id} <node-id> NX EX <interval + probe_timeout>` — guarantees no duplicate in-flight probes even with queue backlog or multiple scheduler instances; TTL is the crash safety net |
-| Q3 | First check of a new point | **Immediately due** (`next_due = now` on resync-add) — fast feedback after creation; configurable later if needed |
-| Q4 | Scheduler on/off for dev | `SCHEDULER_ENABLED` env (default `true`) so API-only dev/test runs don't enqueue probes |
-
-### Design
-
-New module `backend/src/scheduler/mod.rs`:
-
-```text
-SchedulerDeps {
-    alert_points: Arc<dyn AlertPointRepository>,
-    queue:       Arc<dyn ProbeQueue>,
-    inflight:    Arc<dyn InFlightGuard>,
-    resync:      Arc<Notify>,          // poked by API mutations
-}
-
-loop {                                  // per tick (1s)
-    every RESYNC_SECS or on notify:
-        resync()   // fetch enabled points; add new (next_due = now),
-                   // remove disabled/deleted, refresh intervals/urls
-    for target where next_due <= now:
-        if !inflight.try_acquire(target_id, ttl = interval + timeout): continue  // skip, keep due
-        match queue.enqueue_probe_job(&job_for_point(point)) {
-            Ok(_)  => next_due[target] = now + interval
-            Err(e) => { inflight.release(target_id); log; /* retry next tick */ }
-        }
-}
+```
+backend/src/workers/
+├── mod.rs             # add `pub mod scheduler;`
+└── scheduler.rs       # NEW
 ```
 
-- **`InFlightGuard` trait** (in `queue/`): `try_acquire(target_id, ttl) -> bool`, `release(target_id)`. `RedisInFlightGuard` uses `SET … NX EX`; an `InMemoryGuard` fake ships under `test-utils`.
-- **Worker cooperation (2.3)**: the worker `DEL`s the in-flight key when a probe completes, so the next interval fires on time; the TTL only covers crashed workers.
-- **Shared job builder**: extract `queue::job_for_point(&AlertPoint) -> ProbeJob` (used by both the `POST /{id}/test` handler and the scheduler; keeps `DEFAULT_PROBE_TIMEOUT_MS` single-sourced).
-- **CRUD coupling**: `ApiState` gains `resync: Arc<tokio::sync::Notify>`; `create/update/delete` handlers call `resync.notify_one()`. The scheduler also resyncs every `SCHEDULER_RESYNC_SECS` (default 30) as a safety net.
-- **Config additions** (`Config` + `.env.example`): `SCHEDULER_ENABLED` (true), `SCHEDULER_TICK_MS` (1000), `SCHEDULER_RESYNC_SECS` (30).
-- **Wiring**: `main.rs` spawns the task after pools are built; shutdown-aware (Part 5). Uses the same trait objects as `ApiState`.
-- Missed-time policy: a `next_due` far in the past (server downtime) simply means "due now" — one immediate check, no backlog spam.
+### 3.1.2 Design
 
-### Testing
+- `pub async fn run_scheduler(app: AppState)` — spawned from `main` next to the existing demo generator (`tokio::spawn`), replaced demo task removed (2.4/2.5).
+- Loop with `tokio::time::interval(Duration::from_secs(1))` as the scheduling tick; every tick:
+  1. `SELECT ... FROM alert_points WHERE enabled` — via a **new repo fn** `alert_points::list_due(pool, now)`:
+     ```sql
+     SELECT ... FROM alert_points
+     WHERE enabled
+       AND now() >= COALESCE(
+             -- next due = last probe of this point + interval, else due immediately
+             (SELECT timestamp + make_interval(secs => ap.check_interval_seconds)
+              FROM probe_results pr WHERE pr.alert_point_id = ap.id
+              ORDER BY timestamp DESC LIMIT 1),
+             now())
+     ```
+     (Alternative: track `last_checked_at` column on `alert_points` in migration `0002` — **simpler and cheaper than the correlated subquery; recommended**. See §8 migration.)
+  2. For each due point, build a `ProbeJob` (fields already defined in `queue::ProbeJob`; `timeout_ms` = `min(expected * 3, configured)` or a fixed default like 10 s — decide constant in `config.rs`).
+  3. **Duplicate in-flight gate**: before `enqueue_probe_job`, `SETNX` a lock key `sentinel:inflight:{target_id}` with `SET NX EX <check_interval_seconds + 30>`; skip enqueue when the key exists. Worker deletes the key when the job is done (see 2.3). This prevents pile-up when a probe is slow or the worker is down.
+  4. `queue::enqueue_probe_job(&app.redis, &job)`.
+- Error policy: per-target failures are logged and skipped (one bad row must not kill the loop); DB/Redis connection errors log at `error!` and the loop continues after backoff.
+- Respects `app.shutdown_token` in the same `tokio::select!` pattern as the current demo generator.
 
-- **Unit (fakes, no services)**: due-target selection; lock prevents duplicate enqueue; lock-conflict skips without advancing `next_due`; enqueue failure releases lock + retries; resync adds/removes/reset intervals; disabled points never scheduled.
-- **Smoke (behind `smoke-tests`)**: live DB+Valkey — create point with 1s interval → job appears in `sentinel:probe_jobs` within a tick; in-flight key present; duplicate tick does not double-enqueue while the lock is held.
+### 3.1.3 Config additions (`src/config.rs`)
 
-### Definition of done
-
-- [ ] `scheduler` module with tick loop + due map + resync (periodic + notify)
-- [ ] `InFlightGuard` trait + Redis impl + in-memory fake (exported under `test-utils`)
-- [ ] `job_for_point` shared helper; `POST /{id}/test` refactored onto it
-- [ ] `ApiState.resync` notify wired from create/update/delete handlers
-- [ ] Config envs + `.env.example` updated
-- [ ] Unit tests over fakes green; smoke test green with live services
-- [ ] `docs/tasks.md` 2.2 ticked; this part updated to *Implemented*
-
-### Implementation order
-
-1. `job_for_point` extraction + `InFlightGuard` trait/impls
-2. Scheduler tick loop + resync logic (pure, over fakes) + unit tests
-3. `main.rs` wiring + config + notify coupling in API handlers
-4. Smoke test + docs update
-
----
-
-## Part 3 — Task 2.3 Worker Service (GIS Probe Executor & Evaluator)
-
-Status: 📝 **PLANNED**
-
-### Decisions (confirmed)
-
-| # | Question | Decision |
-|---|----------|----------|
-| Q1 | Probe depth | **HTTP status + content sniff** — reqwest GET/POST with headers/auth/timeout; sniff body for service signatures (`WMS_Capabilities`, `FeatureCollection`, ArcGIS `json.Folder`, …). No XML parser dep. Capability-level parsing = optional follow-up (2.3b) |
-| Q2 | Signature mismatch on 2xx | Treated as **Down** (`"unexpected response content"`) — the point exists to monitor a specific GIS service |
-| Q3 | Status model | **Derived, no schema change**: `Healthy` = 2xx + signature + latency ≤ expected; `Degraded` = up but slow; `Down` = error / 4xx / 5xx / mismatch / timeout |
-| Q4 | Concurrency | `WORKER_CONCURRENCY` env, default **4** |
-| Q5 | Latency measurement | Total request duration via `Instant` (TTFB split deferred — no consumer yet) |
-| Q6 | Auth convention | `auth_config`: `{"kind":"basic","username","password"}` or `{"kind":"bearer","token"}`; ad-hoc tokens go through `custom_headers` |
-
-### Alert state machine (pure function, `evaluate.rs`)
-
-| Probe result | Open alert? | Action |
+| Env var | Default | Purpose |
 |---|---|---|
-| Down | none | insert `New` alert (reason = status/error) + publish `New` |
-| Down | open, same reason | no-op (no event spam) |
-| Down | open, different reason | publish `Update` (row reason unchanged = first cause) |
-| Degraded | none | insert `New` (`"slow: {ms} ms > {expected} ms"`) + publish |
-| Degraded | open (Down) | publish `Update` |
-| Healthy | open | `resolve` + publish `Remove` |
-| Healthy | none | no-op |
+| `SCHEDULER_TICK_SECONDS` | `5` | how often the scheduler polls for due targets |
+| `PROBE_TIMEOUT_MS_DEFAULT` | `10000` | fallback timeout when target has none |
 
-### Design
+---
 
-```text
-src/worker/
-├── mod.rs       # N worker loops: BRPOP(timeout) → probe → persist → evaluate → publish → release lock
-├── probe.rs     # ProbeExecutor trait + ReqwestProbeExecutor + per-type signature sniffing
-└── evaluate.rs  # evaluate(outcome, open_alert) -> Option<Action>; AlertEvent building
+## 4. Task 2.3 — Worker Service (GIS Probe Executor & Evaluator) ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):**
+> - `ProbeJob` extended per Q2-a: `target_name`, `http_method`, `custom_headers`,
+>   `auth` (tagged `AuthSpec` enum) — all `#[serde(default)]` for queue compatibility.
+> - `probe/gis.rs`: `build_probe_url` (GetCapabilities / `f=pjson` params, case-
+>   insensitive param replacement), `check_service_response` (quick-xml root check,
+>   ServiceException detection, OAF `links`, ArcGIS `error` key).
+> - `probe/evaluate.rs`: `Evaluator` state machine (Down after `PROBE_FAILURE_THRESHOLD`
+>   consecutive failures; Degraded on latency > SLA; recovery on first success;
+>   `AlertAction::{None, RaiseNew, UpdateOpen, Resolve}`).
+> - **Shared evaluator fix found in live testing:** N workers each keeping their own
+>   in-memory state caused duplicate `New` raises (unique constraint caught it).
+>   The evaluator is now one `Arc<Mutex<..>>` in `AppState`; plus a defensive
+>   fallback downgrades a racing `RaiseNew` to an update of the open alert.
+> - `active_alerts::update_open` added for `Update` events.
+> - `ws_protocol.rs` (`AlertEvent`, `ServiceStatus`, `WsMessage` envelope) — the
+>   worker broadcasts serialized `AlertEvent`s; `sentinel_ws` switches to the
+>   envelope in task 2.4.
+> - Config: `WORKER_CONCURRENCY=2`, `PROBE_FAILURE_THRESHOLD=2` (min 1).
+> - Live verification: dead target → 1× `New`/Down broadcast + probe rows persisted;
+>   healthy target → probes persisted, no alert; repointing the dead target →
+>   `Remove`/Healthy broadcast; zero worker errors after the shared-evaluator fix;
+>   stale jobs for deleted targets fail soft (FK violation logged, gate released).
+
+### 4.1.1 New modules
+
+```
+backend/src/probe/mod.rs        # NEW — orchestrator: worker loop
+backend/src/probe/client.rs     # NEW — reqwest probe execution
+backend/src/probe/gis.rs        # NEW — service-type-specific checks
+backend/src/probe/evaluate.rs   # NEW — state transition evaluation
+backend/src/workers/mod.rs      # add `pub mod probe_worker;` (loop entrypoint)
 ```
 
-- **`ProbeExecutor` trait**: `async fn probe(&self, job, auth, headers) -> ProbeOutcome` — `ReqwestProbeExecutor` in prod; a fake drives tests. `ProbeOutcome { status: Healthy{ms}|Degraded{ms}|Down{reason}, status_code, error_message, snippet }`.
-- **Probe request**: URL/method/headers from the alert point (fetched by id — `ProbeJob` wire contract stays unchanged); timeout = `job.timeout_ms`; timeout → `Down`.
-- **Persistence**: every probe inserts a `probe_results` row (store truncates snippets); alert lifecycle via `ActiveAlertStore`.
-- **Events**: worker publishes `AlertEvent` to `sentinel:alerts` via a new **`AlertBus`** trait (Redis `PUBLISH` impl + in-memory fake under `test-utils`). Payload keeps the frontend-compatible `SentinelAlert` shape (`{id, name, atype, performance, expected, up, reason, error}`) extended with `point_id` + `status` (`Down|Degraded`); `id` = active-alert id (stable across `New`→`Update`→`Remove` so the frontend can key on it). Frontend adopts `status`/`point_id` in task 3.1.
-- **In-flight release**: worker `DEL`s `sentinel:inflight:{target_id}` after completion (scheduler's TTL is only the crash net).
-- **Graceful shutdown** (Part 5): workers poll with short timeout, check the cancellation token between jobs, drain in-flight work.
-- **Deps**: `reqwest` (`default-features = false`, `rustls-tls`, `json`).
+### 4.1.2 Worker loop (`workers/probe_worker.rs`)
 
-### Testing
+- `pub async fn run_worker(app: AppState, worker_id: usize)` — one or more instances spawned at startup (`WORKER_CONCURRENCY`, default 2).
+- Loop: `queue::dequeue_probe_job(&app.redis, Duration::from_secs(5))` → on job: execute probe → evaluate → persist → publish → delete in-flight key. `None` (BRPOP timeout) just re-arms the loop. All under `shutdown_token` select.
+- Concurrency *within* a worker: sequential is acceptable initially (BRPOP serializes); parallelism via N workers.
 
-- **`evaluate()` truth-table unit tests** — every row of the transition matrix, over fakes.
-- **Signature sniffing unit tests** — per `ServiceType`, canned bodies (WMS Capabilities XML, WFS, WMTS, OAF FeatureCollection, ArcGIS JSON, HTML junk).
-- **Probe executor tests against a local axum stub server** (ephemeral port: 200+XML, 500, slow response, wrong content, timeout) — self-contained, no external services or Docker.
-- **Worker loop test** — `FakeProbeQueue` + `FakeStores` + in-memory `AlertBus`: enqueue job → assert probe row, alert transition, published event, lock released.
-- **Smoke (behind `smoke-tests`)**: full loop with live Valkey + local stub server.
+### 4.1.3 Probe client (`probe/client.rs`)
 
-### Definition of done
+- Build one `reqwest::Client` per worker (pooling), `timeout` set per-job from `ProbeJob.timeout_ms`.
+- Apply `custom_headers` (from DB — but note: `ProbeJob` currently does **not** carry headers/auth/method. **Decision needed: extend `ProbeJob`** with `http_method`, `custom_headers: HashMap<String,String>`, `auth: Option<AuthKind>` — recommended, keeps worker from re-reading the DB; see §8 Open Question Q2).
+- High-resolution timing via `std::time::Instant`:
+  - **TTFB**: wrap the response body future — `send()` returns after headers; that instant = TTFB. Read the body, record total duration.
+  - Store `response_time_ms` = total transfer duration (TTFB kept in memory / future column — probe_results has one `response_time_ms` column; use total, document it).
+- Return an internal `ProbeOutcome { status_code: Option<i32>, response_time_ms: Option<i32>, is_up: bool, error_message: Option<String>, snippet: Option<String>, service_ok: bool }`.
 
-- [ ] `ProbeExecutor` trait + reqwest impl + sniffing; `AlertBus` trait + Redis/in-memory impls
-- [ ] `evaluate()` transition matrix + unit tests
-- [ ] Worker pool (N loops) with persistence, publishing, lock release
-- [ ] `WORKER_CONCURRENCY` config + `.env.example`
-- [ ] All unit tests green without services; smoke test green with live services
-- [ ] `docs/tasks.md` 2.3 ticked; this part updated to *Implemented*
+### 4.1.4 GIS-specific checks (`probe/gis.rs`)
 
-### Implementation order
-
-1. `ProbeExecutor` + sniffing (+ stub-server tests)
-2. `evaluate()` + truth-table tests
-3. `AlertBus` trait/impls; worker loop wiring persistence + events + lock release
-4. Config, smoke test, docs update
-
----
-
-## Part 4 — Task 2.4 WebSocket & Real-time Alert Hub
-
-Status: 📝 **PLANNED**
-
-### Decisions (confirmed)
-
-| # | Question | Decision |
-|---|----------|----------|
-| Q1 | Transport | **Redis Pub/Sub from the start**: worker → `PUBLISH sentinel:alerts` → hub task → tokio broadcast → WS clients. Multi-instance-safe; pub/sub reconnect handled in the hub |
-| Q2 | Initial state sync | On connect, send full open-alert list composed from DB (open alerts + point names + latest probe result for the latency value), then stream incremental events |
-| Q3 | Wire contract | Keep existing `SentinelAlert` field names (`id`, `name`, `atype`, `performance`, `expected`, `up`, `reason`, `error`) for frontend compatibility; `Update`/`Remove` handling + renames are task 3.1 |
-
-### Design
-
-- **Hub task** (`src/handlers/alert_hub.rs`): dedicated Redis pub/sub connection — note `deadpool-redis` does **not** support pub/sub; use `redis::Client::get_async_pubsub()` directly. Subscribe → deserialize `AlertEvent` → `tokio::sync::broadcast::Sender<AlertEvent>` (channel size 64; lag logged).
-- **Reconnect loop**: on pub/sub connection loss, retry with exponential backoff; WS clients keep receiving (broadcast channel bridges the gap briefly).
-- **WS handler** (`sentinel_ws.rs` rewritten): upgrade → initial sync (queries: `active_alerts.list_open` + point names + `probe_results.list_recent(limit 1)` per point — N+1 acceptable at current scale, noted) → split socket → forward broadcast events → ping/keepalive → clean close handling.
-- **Legacy cleanup (from tasks.md 2.4)**: delete `handlers/websockets.rs` (echo demo), delete mock `active_alerts`/broadcast bootstrap in `main.rs`; `AppState` shrinks to the broadcast handle (or merges into `ApiState`); consolidate routes under `/ws/sentinel`.
-- Redis channel constant `sentinel:alerts` already exists in `queue/mod.rs`.
-
-### Testing
-
-- **Unit**: `AlertEvent` serde round-trip; initial-sync composition over `FakeStores`.
-- **Integration (no services)**: WS client (`tokio-tungstenite`, already a dep) against the router with fakes — connect → receive initial state; trigger fake event → receive it.
-- **Smoke (behind `smoke-tests`)**: live pub/sub end-to-end — worker publishes → WS client receives.
-
-### Definition of done
-
-- [ ] Hub task with pub/sub subscribe + reconnect + broadcast fan-out
-- [ ] Rewritten `sentinel_ws.rs` with initial DB sync; echo/legacy demo removed
-- [ ] `main.rs` mock data + legacy routes cleaned up; routes consolidated
-- [ ] Wire contract documented (payload fields + `New`/`Update`/`Remove` semantics)
-- [ ] Unit + no-service integration tests green; smoke test green
-- [ ] `docs/tasks.md` 2.4 ticked; this part updated to *Implemented*
-
-### Implementation order
-
-1. `AlertEvent` payload types + serde tests
-2. Hub task (pub/sub → broadcast) with reconnect
-3. WS handler rewrite + initial sync
-4. Legacy cleanup + integration tests + docs update
-
----
-
-## Part 5 — Task 2.5 Backend Technical Debt & Fixes
-
-Status: 📝 **PLANNED**
-
-### Scope
-
-| Item | Approach |
+| ServiceType | Strategy |
 |---|---|
-| Graceful shutdown | `axum::serve(..).with_graceful_shutdown(ctrl_c)`; a `CancellationToken` stops scheduler tick, worker polls (drain in-flight probes), and the hub; then pools close. Env `SHUTDOWN_TIMEOUT_SECS` (default 30) as hard cap |
-| Request tracing IDs | `tower-http` `RequestIdLayer` + `PropagateRequestIdLayer` (`x-request-id`); id added to the tracing span so logs correlate per request |
-| Config hygiene | All new envs (`SCHEDULER_*`, `WORKER_CONCURRENCY`, `SHUTDOWN_TIMEOUT_SECS`) into `Config` + `.env.example` |
-| sqlx cache | Worker/scheduler reuse existing repo methods — no new queries expected; run `cargo sqlx prepare` only if queries are added |
+| `WMS` / `WFS` / `WMTS` | GET `?service=<SVC>&request=GetCapabilities` (append/merge params into configured URL); HTTP 200 + parse XML root, verify expected service element / `ServiceException` absence. `quick-xml` (or lenient string match on `<Capability>`/root tag — decide; quick-xml recommended). |
+| `OAF` | GET landing page (`/`), expect JSON with `links` array (OGC API — Features conformance). |
+| `ArcGIS_REST` | GET `?f=pjson` health ping → expect JSON without `"error"` key (services directory/health). |
+| `HTTP` | Plain request as configured (method/headers); success = 2xx/3xx. |
 
-### Definition of done
+- HTTP-level failure: connection refused/DNS/timeout → `is_up = false`, `error_message` = error chain. 4xx/5xx → `is_up = false`, status recorded.
+- `service_ok` false but HTTP 200 (e.g. `ServiceException` XML) → still `is_up = true` (transport fine) but reason "service error" → counts as **Degraded/Down per SLA** — encode this in the evaluator (below).
+- Auth: `auth_config` JSONB shapes — `{"type":"basic","username":...,"password":...}` → reqwest basic auth; `{"type":"bearer","token":...}` → `Authorization: Bearer`; `{"type":"header","name":...,"value":...}` → custom header. Never log secret values (mask in tracing).
 
-- [ ] Ctrl-C → clean shutdown: server stops accepting, in-flight probes finish, tasks joined, process exits 0
-- [ ] `x-request-id` on responses + in log lines
-- [ ] `.env.example` documents all envs
-- [ ] `cargo build` + full test suite green
-- [ ] `docs/tasks.md` 2.5 ticked
+### 4.1.5 Alert state evaluation (`probe/evaluate.rs`)
 
-### Cross-part implementation order
+State machine per target (current state = open alert in `active_alerts` via `active_alerts::latest_open`, else "Healthy"):
 
-**Part 2 (scheduler) → Part 3 (worker) → Part 4 (hub) → Part 5 (debt).** Parts 2+3 are co-developed (scheduler's output is the worker's input; both are unit-tested over fakes before live wiring). Shutdown support from Part 5 lands incrementally — each spawned task accepts the cancellation token from day one, so Part 5 is mostly wiring + polish.
+```
+probe ok & latency <= expected  → Healthy
+probe ok & latency >  expected  → Degraded
+probe failed (conn err, 4xx/5xx, service-level error) → Down
+```
+
+Transitions and actions:
+
+| From → To | AlertType emitted | DB writes | Publish |
+|---|---|---|---|
+| Healthy → Down | `New` (reason: unreachable / HTTP status / service error) | `probe_results::insert` + `active_alerts::insert` | WS broadcast |
+| Healthy → Degraded | `New` (reason: latency X ms > expected Y ms) | same | WS broadcast |
+| Down/Degraded → Down/Degraded (reason or latency changed materially) | `Update` | `probe_results::insert` + `active_alerts::update` (**new repo fn** — update `reason`/`alert_type` on open alert) | WS broadcast |
+| Down/Degraded → Healthy | `Remove` | `probe_results::insert` + `active_alerts::resolve` | WS broadcast |
+| Healthy → Healthy | none | `probe_results::insert` only | none |
+
+- Debounce/hysteresis (avoid flapping): require N consecutive failing probes (e.g. 2, configurable `PROBE_FAILURE_THRESHOLD`) before declaring Down; 1 success recovers.
+- The `Remove` event must carry enough info for the frontend to drop the card: include `alert_point_id` + `alert_type: "Remove"` in the payload.
+
+### 4.1.6 Persistence & fan-out
+
+- Persist every probe via existing `probe_results::insert` (snippet already truncated there).
+- Fan-out (task 2.4): after evaluation, publish a JSON `AlertEvent` to **both**:
+  1. Redis Pub/Sub `sentinel:alerts` (existing const) — future multi-instance fan-out, and
+  2. directly to `app.broadcast_tx` (tokio broadcast) — current single-process WS hub.
+
+---
+
+## 5. Task 2.4 — WebSocket & Real-time Alert Hub ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):**
+> - **Migration `0003_alert_status.sql`**: `active_alerts.status` (HEALTHY/DEGRADED/DOWN,
+>   default+backfill `DOWN`) so snapshots report the true current state.
+> - `ServiceStatus` moved to `db/models.rs` (repo layer lives in the lib crate);
+>   `ws_protocol` re-exports it. DB form UPPERCASE, client JSON form snake_case.
+> - `repo::active_alerts::list_open_with_point` — JOIN with `alert_points` for the
+>   snapshot payload (`name`, `url`, `service_type`, `expected_response_time_ms`).
+> - `sentinel_ws.rs`: on connect sends `WsMessage::Snapshot` built from the DB,
+>   then forwards live events from the broadcast channel; echo/ping demo logic
+>   removed. On `Lagged(n)` the client keeps the connection (live events resume;
+>   full re-sync optimization deferred).
+> - Worker broadcasts `WsMessage::Alert(event)` now. **Verified wire shapes**
+>   (serde internally-tagged enum flattens the event fields):
+>
+>   ```json
+>   {"type":"snapshot","alerts":[{"alert_id":11,"status":"down","alert_type":"New",...}]}
+>   {"type":"alert","alert_id":12,"alert_point_id":"…","alert_type":"New","status":"down",...}
+>   ```
+>
+>   (frontend task 3.1 must handle the flattened `alert` fields).
+> - **Demo code deleted**: `handlers/websockets.rs` (+ `/ws` route), `schema.rs`,
+>   `workers/alert_workers.rs`; `AppState` no longer holds the in-memory demo
+>   alert vec — PostgreSQL is the source of truth for snapshots.
+> - Live verification (node native WebSocket client): snapshot-on-connect with the
+>   open alert (`status:down`), live `Alert` `New`/Down event received on an open
+>   connection, `Remove`/Healthy after repointing the target; DB smoke + queue
+>   smoke pass; 21 unit tests; clippy/fmt clean.
+
+### 5.1.1 Replace the demo wire schema (`src/schema.rs`)
+
+`SentinelAlert` (`id: String`, `performance`/`expected`/`up`) is demo-era and diverges from the DB model. Replace with a real event contract:
+
+```rust
+// src/ws_protocol.rs (new; replaces schema.rs)
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsMessage {
+    /// Initial state sync on connect.
+    Snapshot { alerts: Vec<AlertEvent> },
+    /// Lifecycle event: New / Update / Remove.
+    Alert(AlertEvent),
+}
+
+#[derive(Serialize, Clone)]
+pub struct AlertEvent {
+    pub alert_id: i64,
+    pub alert_point_id: Uuid,
+    pub alert_type: AlertType,        // New | Update | Remove
+    pub name: String,                 // join from alert_points
+    pub url: String,
+    pub service_type: ServiceType,
+    pub status: ServiceStatus,        // Healthy | Degraded | Down
+    pub reason: String,
+    pub response_time_ms: Option<i32>,
+    pub expected_response_time_ms: i32,
+    pub triggered_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatus { Healthy, Degraded, Down }
+```
+
+⚠️ **Breaking change for the frontend** — Phase 3 task 3.1 (`processMessage`) must be updated in lockstep. Keep `phase2.md` and the frontend ticket in sync; consider shipping both together.
+
+### 5.1.2 `AppState` changes (`src/main.rs`)
+
+```rust
+pub struct AppState {
+    broadcast_tx: Arc<Sender<Message>>,      // unchanged
+    // REMOVE: active_alerts: Arc<RwLock<Vec<SentinelAlert>>>  (demo state)
+    // REMOVE: demo SentinelAlert seed vec in main()
+    db: PgPool, redis: RedisPool, shutdown_token: CancellationToken,  // unchanged
+}
+```
+
+The "full active alert list" no longer lives in memory — it is read from PostgreSQL (`active_alerts::list_open`) on each client connect (source of truth = DB; in-memory mirror is a cache optimization deferred until needed).
+
+### 5.1.3 `sentinel_ws.rs` rework
+
+- On connect (replaces demo `active_alerts.read()` block):
+  1. `active_alerts::list_open(&app.db)` → build `Vec<AlertEvent>` (join alert-point metadata; either a new repo fn `list_open_with_point` using a JOIN, or N+1 `alert_points::get` — prefer the JOIN).
+  2. Send `WsMessage::Snapshot { alerts }` as the first frame.
+  3. Then subscribe to `broadcast_tx` and forward live `Alert` events (existing send-task loop is kept).
+- Inbound client messages: keep minimal (echo/ping); define a proper client→server envelope only when the frontend needs it (Phase 3).
+
+### 5.1.4 Redis Pub/Sub bridge (recommended for correctness under multi-process, optional for single node)
+
+- New `backend/src/workers/pubsub_bridge.rs`: task subscribing to `sentinel:alerts`, forwarding every message into `broadcast_tx`.
+- Worker publishes to Pub/Sub **only**; bridge fans into the in-process tokio broadcast. (Simpler alternative: worker publishes directly to both — acceptable for Phase 2 single-node, note as tech debt.)
+
+### 5.1.5 Cleanup
+
+- **Delete** `backend/src/handlers/websockets.rs` + its `/ws` route and `mod` entry (task explicitly requires this).
+- **Delete** `backend/src/workers/alert_workers.rs` demo generator and its spawn in `main.rs` (superseded by scheduler + probe worker).
+- **Delete** `backend/src/schema.rs` demo types (replaced by 5.1.1).
+- Update `handlers/mod.rs`, `workers/mod.rs`.
+
+---
+
+## 6. Task 2.5 — Technical Debt & Fixes ✅ IMPLEMENTED
+
+> **Implementation notes (2026-09-18):**
+> - ✅ Cross-platform embed path (done in Phase 1).
+> - **Graceful shutdown** (reviewed the merged implementation; it was correct):
+>   SIGINT/SIGTERM → `CancellationToken.cancel()` → axum drains HTTP and upgraded
+>   WS connections (handlers abort their tasks on the token and send `Close`
+>   frames). Added in this pass: scheduler/worker `JoinHandle`s are now awaited
+>   after the server stops (bounded at 30 s, warn-and-continue), then
+>   `db_pool.close().await` + `redis_pool.close()`; token cancel is idempotent
+>   so server-stop-for-any-reason also reaches the background tasks.
+> - **Request tracing IDs**: `tower-http` `request-id` feature —
+>   `SetRequestIdLayer` (server-generated UUID v4, honoring incoming
+>   `x-request-id`) → `TraceLayer` with a custom `http_request` span carrying
+>   `request_id`/`method`/`uri` → `PropagateRequestIdLayer` echoes the id on the
+>   response. Handler logs inherit the span, e.g.:
+>   `http_request{request_id=my-trace-42 method=POST uri=/api/v1/alert-points}: alert point created`
+> - Uniform API error handling was delivered with task 2.1 (`ApiError`).
+> - Live verification: header set/honored/propagated; request_id in handler logs;
+>   SIGINT with an open WebSocket → snapshot delivered, close frame `code=1000`,
+>   all 3 background tasks joined, pools closed, `Server shut down complete`.
+>   (Note: lingering zombie PIDs after runs are a sandbox artifact — PID 1 here
+>   does not reap orphans; the processes themselves exited cleanly.)
+
+- [x] Cross-platform embed path (done in Phase 1).
+- [ ] **Graceful shutdown hardening** (`main.rs`):
+  - `CancellationToken` already exists — extend it to:
+    1. cancel scheduler + workers (they exit their loops),
+    2. drain WS connections: `broadcast_tx` senders dropped → send tasks see `RecvError::Closed` → close frames already implemented in `sentinel_ws.rs`,
+    3. `axum::serve(...).with_graceful_shutdown(token.cancelled_owned())`,
+    4. `db_pool.close().await` + `redis_pool.close()` after server exit.
+  - Worker loops must finish the in-flight probe before exiting (check token between jobs, not mid-probe).
+- [ ] **Request tracing IDs**:
+  - Add `tower-http` `RequestIdLayer` + `PropagateRequestIdLayer` (already have `tower-http` 0.6) or a small custom middleware; log `request_id` in `TraceLayer` spans (`make_span_with` including the id header).
+  - Structured logging: switch `tracing_subscriber::fmt` to JSON in non-dev (`LOG_FORMAT=json`, default `pretty`) — optional, cheap.
+- [ ] `.env.example` additions: `SCHEDULER_TICK_SECONDS`, `WORKER_CONCURRENCY`, `PROBE_TIMEOUT_MS_DEFAULT`, `PROBE_FAILURE_THRESHOLD`, `APP_CORS_ORIGINS`.
+
+---
+
+## 7. File-by-file change summary
+
+| File | Action |
+|---|---|
+| `Cargo.toml` | add `reqwest`, (opt) `validator`, `quick-xml`, `url`; dev-dep `wiremock` |
+| `migrations/0002_scheduler_state.sql` | ✅ DONE — `alert_points.last_checked_at TIMESTAMPTZ` + partial index on enabled rows |
+| `src/main.rs` | mount `/api/v1/alert-points` nest; spawn scheduler + N probe workers + pubsub bridge; remove demo worker spawn; graceful shutdown wiring |
+| `src/lib.rs` | add `pub mod ws_protocol; pub mod probe;` |
+| `src/config.rs` | ✅ DONE — `SCHEDULER_TICK_SECONDS`, `PROBE_TIMEOUT_MS_DEFAULT` (+ `.env.example`) |
+| `src/db/models.rs` | add `last_checked_at` to `AlertPoint`; add `ServiceStatus` enum; (opt) `AuthConfig` typed deserializer; add `ProbeJob`-support types if ProbeJob is extended |
+| `src/db/repo/alert_points.rs` | ✅ DONE — `list_due(pool)` + `touch_last_checked(id)`; all SELECTs include `last_checked_at` |
+| `src/db/repo/active_alerts.rs` | add `update_reason(point_id, reason)` for `Update` events; add `list_open_with_point` JOIN query |
+| `src/queue/mod.rs` | (opt) extend `ProbeJob` with method/headers/auth; add `publish_alert_event()` + `subscribe_alerts()` Pub/Sub helpers |
+| `src/handlers/mod.rs` | add `alert_points_api`, `error` modules |
+| `src/handlers/alert_points_api.rs` | **NEW** — 6 REST handlers + router + pagination/filter params |
+| `src/handlers/error.rs` | **NEW** — `ApiError` + `IntoResponse` |
+| `src/handlers/sentinel_ws.rs` | ✅ DONE — snapshot-on-connect from DB, `WsMessage` protocol, demo reads/echo removed |
+| `src/handlers/websockets.rs` | ✅ DELETED |
+| `src/handlers/mod.rs` | ✅ DONE — `websockets` removed |
+| `src/schema.rs` | ✅ DELETED (replaced by `ws_protocol.rs`) |
+| `src/ws_protocol.rs` | ✅ DONE — `WsMessage::{Snapshot, Alert}`, `AlertEvent`; `ServiceStatus` lives in `db/models.rs` and is re-exported |
+| `src/probe/mod.rs`, `src/probe/client.rs`, `src/probe/gis.rs`, `src/probe/evaluate.rs` | ✅ DONE — probe execution + evaluation engine |
+| `src/workers/mod.rs` | ✅ DONE — `scheduler`, `probe_worker` |
+| `src/workers/scheduler.rs` | ✅ DONE — due-target polling + in-flight gate + enqueue; spawned from `main` |
+| `src/workers/probe_worker.rs` | ✅ DONE — BRPOP loop → probe → evaluate → persist → broadcast (in `WsMessage::Alert` envelope) → gate release |
+| `src/workers/pubsub_bridge.rs` | deferred (multi-instance upgrade path; single-process tokio broadcast suffices for Phase 2) |
+| `src/workers/alert_workers.rs` | ✅ DELETED |
+| `tests/queue_smoke.rs` | keep; add `tests/api_alert_points.rs`, `tests/probe_eval.rs` (unit) |
+
+---
+
+## 8. Open Questions (need decisions before/during implementation)
+
+| # | Question | Options | Recommendation |
+|---|---|---|---|
+| Q1 | Scheduler "due" tracking | a) `last_checked_at` column + migration 0002 (recommended), b) correlated subquery on `probe_results` per tick | **a** — one column, trivially indexable |
+| Q2 | `ProbeJob` payload | a) extend with `http_method`, `custom_headers`, `auth` (recommended — worker stays DB-free), b) worker re-reads `alert_points` row by `target_id` before probing | **a**; field additions are backward-compatible while queue is empty |
+| Q3 | WS fan-out topology | a) worker → Redis Pub/Sub → bridge → tokio broadcast (multi-node ready), b) worker → tokio broadcast directly (single-node, simpler) | **b for Phase 2**, leave Pub/Sub const + bridge as the documented upgrade path |
+| Q4 | Concurrent failing-probe threshold | flap protection N=1 (alert immediately) vs N=2–3 (stable but delayed) | **N=2** via `PROBE_FAILURE_THRESHOLD`, `1` disables |
+| Q5 | Validation approach | a) `validator` crate derive, b) hand-written `validate()` returning `Vec<(field, msg)>` | **b** — fewer deps, validation is bespoke (URL + service-type pairing) |
+| Q6 | On-demand `/test` endpoint semantics | a) run probe inline synchronously and return result (simplest, bounded by timeout), b) enqueue high-priority job + poll result | **a** |
+
+---
+
+## 9. Verification plan (mirrors phase1.md style)
+
+1. `cargo check` / `cargo clippy` / `cargo fmt --check` clean; `cargo sqlx prepare` re-run after any new query macros.
+2. `cargo test` — new unit tests for evaluation state machine (no network) + `wiremock`-based probe tests + API integration tests against test DB.
+3. Manual end-to-end against shared instance (`postgres-gs`, Valkey container from task 1.4):
+   - insert an `alert_point` via `POST /api/v1/alert-points` pointing at a deliberately slow/dead URL,
+   - observe scheduler enqueue (`LLEN sentinel:probe_jobs`), worker probe, `probe_results` row, `active_alerts` row,
+   - connect to `wss://.../ws/sentinel` and verify `Snapshot` + live `Alert` events for New/Update/Remove,
+   - `Ctrl-C` → verify graceful drain in logs.

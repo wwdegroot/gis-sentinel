@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            timestamp,\n            response_time_ms,\n            status_code,\n            is_up,\n            error_message\n        FROM probe_results\n        WHERE alert_point_id = $1\n          AND is_up = false\n          AND timestamp > now() - make_interval(hours => $2)\n        ORDER BY timestamp DESC, id DESC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "response_time_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "status_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "is_up",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "error_message",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "656a526022329ca680fbe28c4900b1e6aaa4e6170d4405bfc0a141b33fba2ea0"
+}

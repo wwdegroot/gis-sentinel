@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id,\n            alert_point_id,\n            alert_type AS \"alert_type: AlertType\",\n            reason,\n            triggered_at,\n            resolved_at\n        FROM active_alerts\n        WHERE alert_point_id = $1 AND resolved_at IS NULL\n        ORDER BY triggered_at DESC, id DESC\n        LIMIT 1\n        ",
+  "query": "\n        UPDATE active_alerts\n        SET alert_type = $2, status = $3, reason = $4\n        WHERE alert_point_id = $1 AND resolved_at IS NULL\n        RETURNING id, alert_point_id, alert_type AS \"alert_type: AlertType\", status AS \"status: ServiceStatus\", reason, triggered_at, resolved_at\n        ",
   "describe": {
     "columns": [
       {
@@ -20,23 +20,31 @@
       },
       {
         "ordinal": 3,
-        "name": "reason",
+        "name": "status: ServiceStatus",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "triggered_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "resolved_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text",
+        "Text",
+        "Text"
       ]
     },
     "nullable": [
@@ -45,8 +53,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "fa3ee5320fbdaf2d7378eda7f82439117649500f2c3bd82f73843f4d9a4ab03b"
+  "hash": "f714db5bdaad2316ef54890e4bf70eda212573eb6eb6d850d8e47ec23b2a2c59"
 }

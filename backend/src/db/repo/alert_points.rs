@@ -1,36 +1,16 @@
-//! PostgreSQL implementation of [`AlertPointRepository`] (task 2.1).
-//!
-//! The sqlx bodies are unchanged from the original free functions; they were
-//! only moved behind the trait abstraction in `repo::traits` (docs/tests.md).
-
-use crate::db::models::{AlertPoint, NewAlertPoint, ServiceType, UpdateAlertPoint};
-use crate::db::repo::traits::{AlertPointRepository, RepoError};
-use async_trait::async_trait;
+use crate::db::models::{AlertPoint, ServiceType};
+use crate::db::models::{NewAlertPoint, UpdateAlertPoint};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// Optional list filters shared by `list_filtered` / `count_filtered`.
-#[derive(Debug, Default, Clone)]
-pub struct ListFilter {
-    /// Exact match on `enabled` when `Some`.
-    pub enabled: Option<bool>,
-    /// Exact match on `service_type` when `Some`.
-    pub service_type: Option<ServiceType>,
-    /// Case-insensitive substring match on `name` / `url` (already pattern-escaped).
-    pub search: Option<String>,
-}
-
-/// sqlx-backed `alert_points` repository wrapping a connection pool.
-#[derive(Debug, Clone)]
-pub struct PgAlertPointRepository {
-    pool: PgPool,
-}
-
-impl PgAlertPointRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-}
+/// Insert a new alert point. The client-side generated UUID v7 is stored as-is.
+pub async fn create(pool: &PgPool, new: NewAlertPoint) -> Result<AlertPoint, sqlx::Error> {
+    let id = Uuid::now_v7();
+    let custom_headers = if new.custom_headers.is_null() {
+        serde_json::json!({})
+    } else {
+        new.custom_headers
+    };
 
 #[async_trait]
 impl AlertPointRepository for PgAlertPointRepository {
@@ -64,7 +44,8 @@ impl AlertPointRepository for PgAlertPointRepository {
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         "#,
             id,
             new.name,
@@ -82,16 +63,20 @@ impl AlertPointRepository for PgAlertPointRepository {
         .map_err(RepoError::from_sqlx)
     }
 
-    /// List alert points, optionally only the enabled ones, ordered by creation.
-    async fn list(
-        &self,
-        enabled_only: bool,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AlertPoint>, RepoError> {
-        sqlx::query_as!(
-            AlertPoint,
-            r#"
+/// List alert points with optional filtering and pagination, ordered by creation.
+///
+/// `enabled_only` restricts to enabled points, `service_type` (when given)
+/// filters on the GIS service type. Pagination is `limit`/`offset` based.
+pub async fn list(
+    pool: &PgPool,
+    enabled_only: bool,
+    service_type: Option<ServiceType>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AlertPoint>, sqlx::Error> {
+    sqlx::query_as!(
+        AlertPoint,
+        r#"
         SELECT
             id,
             name,
@@ -104,32 +89,48 @@ impl AlertPointRepository for PgAlertPointRepository {
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         FROM alert_points
-        WHERE (NOT $1::bool) OR enabled
+        WHERE ((NOT $1::bool) OR enabled)
+          AND ($2::text IS NULL OR service_type = $2::text)
         ORDER BY created_at, id
-        LIMIT $2 OFFSET $3
+        LIMIT $3 OFFSET $4
         "#,
-            enabled_only,
-            limit,
-            offset,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
+        enabled_only,
+        service_type as Option<ServiceType>,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await
+}
 
-    /// List alert points with optional filtering (task 2.1 pagination support),
-    /// ordered by creation.
-    async fn list_filtered(
-        &self,
-        filter: &ListFilter,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AlertPoint>, RepoError> {
-        sqlx::query_as!(
-            AlertPoint,
-            r#"
+/// Count alert points matching the same filter as [`list`] (for pagination totals).
+pub async fn count(
+    pool: &PgPool,
+    enabled_only: bool,
+    service_type: Option<ServiceType>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT count(*)::bigint AS "count!"
+        FROM alert_points
+        WHERE ((NOT $1::bool) OR enabled)
+          AND ($2::text IS NULL OR service_type = $2::text)
+        "#,
+        enabled_only,
+        service_type as Option<ServiceType>,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Fetch a single alert point by id.
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<AlertPoint, sqlx::Error> {
+    sqlx::query_as!(
+        AlertPoint,
+        r#"
         SELECT
             id,
             name,
@@ -142,62 +143,8 @@ impl AlertPointRepository for PgAlertPointRepository {
             auth_config,
             enabled,
             created_at,
-            updated_at
-        FROM alert_points
-        WHERE ($1::bool  IS NULL OR enabled = $1)
-          AND ($2::text  IS NULL OR service_type = $2)
-          AND ($3::text  IS NULL OR name ILIKE $3 OR url ILIKE $3)
-        ORDER BY created_at, id
-        LIMIT $4 OFFSET $5
-        "#,
-            filter.enabled,
-            filter.service_type.map(|st| st.as_str().to_string()),
-            filter.search,
-            limit,
-            offset,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
-
-    /// Count rows matching [`ListFilter`] (pagination `total`, same WHERE as `list_filtered`).
-    async fn count_filtered(&self, filter: &ListFilter) -> Result<i64, RepoError> {
-        sqlx::query_scalar!(
-            r#"
-        SELECT count(*) AS "count!: i64"
-        FROM alert_points
-        WHERE ($1::bool  IS NULL OR enabled = $1)
-          AND ($2::text  IS NULL OR service_type = $2)
-          AND ($3::text  IS NULL OR name ILIKE $3 OR url ILIKE $3)
-        "#,
-            filter.enabled,
-            filter.service_type.map(|st| st.as_str().to_string()),
-            filter.search,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(RepoError::from_sqlx)
-    }
-
-    /// Fetch a single alert point by id.
-    async fn get(&self, id: Uuid) -> Result<AlertPoint, RepoError> {
-        sqlx::query_as!(
-            AlertPoint,
-            r#"
-        SELECT
-            id,
-            name,
-            url,
-            service_type AS "service_type: ServiceType",
-            check_interval_seconds,
-            expected_response_time_ms,
-            http_method AS "http_method: _",
-            custom_headers,
-            auth_config,
-            enabled,
-            created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         FROM alert_points
         WHERE id = $1
         "#,
@@ -241,7 +188,8 @@ impl AlertPointRepository for PgAlertPointRepository {
             auth_config,
             enabled,
             created_at,
-            updated_at
+            updated_at,
+            last_checked_at
         "#,
             id,
             input.name,
@@ -268,4 +216,54 @@ impl AlertPointRepository for PgAlertPointRepository {
             .map_err(RepoError::from_sqlx)?;
         Ok(result.rows_affected() > 0)
     }
+}
+
+/// All enabled alert points whose check interval has elapsed (scheduler
+/// producer query, task 2.2). A point is due when it has never been checked
+/// or `last_checked_at + check_interval_seconds <= now()`.
+pub async fn list_due(pool: &PgPool) -> Result<Vec<AlertPoint>, sqlx::Error> {
+    sqlx::query_as!(
+        AlertPoint,
+        r#"
+        SELECT
+            id,
+            name,
+            url,
+            service_type AS "service_type: ServiceType",
+            check_interval_seconds,
+            expected_response_time_ms,
+            http_method AS "http_method: _",
+            custom_headers,
+            auth_config,
+            enabled,
+            created_at,
+            updated_at,
+            last_checked_at
+        FROM alert_points
+        WHERE enabled
+          AND (
+                last_checked_at IS NULL
+                OR last_checked_at + make_interval(secs => check_interval_seconds) <= now()
+              )
+        ORDER BY created_at, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Mark an alert point as just enqueued for probing (scheduler bookkeeping).
+/// Returns the recorded timestamp.
+pub async fn touch_last_checked(pool: &PgPool, id: Uuid) -> Result<DateTime<Utc>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        UPDATE alert_points
+        SET last_checked_at = now()
+        WHERE id = $1
+        RETURNING last_checked_at AS "last_checked_at!"
+        "#,
+        id,
+    )
+    .fetch_one(pool)
+    .await
 }

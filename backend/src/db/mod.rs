@@ -1,7 +1,9 @@
 pub mod models;
 pub mod repo;
 
-pub use models::{ActiveAlert, AlertPoint, AlertType, HttpMethod, ProbeResult, ServiceType};
+pub use models::{
+    ActiveAlert, AlertPoint, AlertType, HttpMethod, ProbeResult, Role, ServiceType, User,
+};
 
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};

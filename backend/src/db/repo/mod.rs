@@ -10,13 +10,4 @@ pub mod alert_points;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fake;
 pub mod probe_results;
-pub mod traits;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub use fake::{FakeActiveAlertStore, FakeAlertPointRepository, FakeProbeResultStore, FakeStores};
-pub use traits::{ActiveAlertStore, AlertPointRepository, ProbeResultStore, RepoError};
-
-// re-export the sqlx-backed implementations
-pub use active_alerts::PgActiveAlertStore;
-pub use alert_points::{ListFilter, PgAlertPointRepository};
-pub use probe_results::PgProbeResultStore;
+pub mod users;

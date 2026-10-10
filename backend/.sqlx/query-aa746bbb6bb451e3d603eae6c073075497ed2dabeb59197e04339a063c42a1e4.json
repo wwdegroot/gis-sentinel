@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id,\n            name,\n            url,\n            service_type AS \"service_type: ServiceType\",\n            check_interval_seconds,\n            expected_response_time_ms,\n            http_method AS \"http_method: _\",\n            custom_headers,\n            auth_config,\n            enabled,\n            created_at,\n            updated_at\n        FROM alert_points\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT\n            id,\n            name,\n            url,\n            service_type AS \"service_type: ServiceType\",\n            check_interval_seconds,\n            expected_response_time_ms,\n            http_method AS \"http_method: _\",\n            custom_headers,\n            auth_config,\n            enabled,\n            created_at,\n            updated_at,\n            last_checked_at\n        FROM alert_points\n        WHERE ((NOT $1::bool) OR enabled)\n          AND ($2::text IS NULL OR service_type = $2::text)\n        ORDER BY created_at, id\n        LIMIT $3 OFFSET $4\n        ",
   "describe": {
     "columns": [
       {
@@ -62,11 +62,19 @@
         "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "last_checked_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Bool",
+        "Text",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -81,8 +89,9 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "18d11aa99c4ca8c6426d14f6b05762dd39410b2d4682c96b15f2188236e15182"
+  "hash": "aa746bbb6bb451e3d603eae6c073075497ed2dabeb59197e04339a063c42a1e4"
 }

@@ -1,36 +1,29 @@
+pub mod auth;
 pub mod config;
 pub mod handlers;
-pub mod schema;
+pub mod probe;
 pub mod workers;
+pub mod ws_protocol;
 
 use crate::config::Config;
 use crate::handlers::{
-    generic::static_handler, sentinel_ws::ws_sentinel_handler, websockets::ws_handler,
+    alert_points_api, auth_api, generic::static_handler, sentinel_ws::ws_sentinel_handler,
 };
-use anyhow::Context;
-use backend::api::{router as api_router, ApiState};
-use backend::config::Config;
-use backend::queue::ProbeQueue;
-use backend::{db, queue};
+use backend::db;
+use backend::queue;
 
-use axum::extract::ws::Message;
-use axum::routing::{get, Router};
-use schema::{AlertType, SentinelAlert};
-use sqlx::PgPool;
-use crate::workers::alert_workers;
+use crate::workers::{probe_worker, scheduler};
 use anyhow::Result;
 use axum::extract::ws::Message;
 use axum::routing::{get, Router};
-use schema::SentinelAlert;
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::{
-    broadcast::{self, Receiver, Sender},
-    RwLock,
-};
+use tokio::sync::broadcast::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tower_http::request_id::MakeRequestUuid;
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// State of the legacy demo WebSocket routes.
@@ -39,11 +32,24 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// are consumed by the `/api/v1` REST routes (and later scheduler/worker).
 #[derive(Debug, Clone)]
 pub struct AppState {
-    broadcast_tx: Arc<Mutex<Sender<Message>>>,
-    /// Kept for future fan-in usage; currently receivers subscribe directly.
-    #[allow(dead_code)]
-    broadcast_rx: Arc<Mutex<Receiver<Message>>>,
-    active_alerts: Arc<Mutex<Vec<SentinelAlert>>>,
+    // broadcast::Sender is Send + Sync and all its methods take &self, so a
+    // plain Arc suffices for sharing it across handlers/workers. New receivers
+    // are created via `subscribe()` (fan-out); re-derive a Receiver on demand
+    // if fan-in is ever needed.
+    broadcast_tx: Arc<Sender<Message>>,
+    /// PostgreSQL connection pool, shared across handlers/services.
+    /// (Used by the REST API, the WS snapshot, and the probe worker.)
+    db: PgPool,
+    /// Valkey/Redis connection pool for the probe job queue.
+    /// (Consumed by the scheduler and the probe worker.)
+    redis: queue::RedisPool,
+    /// Shared per-target alert state machine (failure streaks, last status).
+    /// One instance across all workers so `New` alerts are raised exactly once
+    /// regardless of which worker processes a job.
+    evaluator: Arc<tokio::sync::Mutex<probe::evaluate::Evaluator>>,
+    /// Typed application configuration (scheduler knobs etc.).
+    config: Config,
+    shutdown_token: CancellationToken,
 }
 
 #[tokio::main]
@@ -52,12 +58,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("invalid configuration")?;
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    let config = Config::from_env().unwrap_or_else(|e| panic!("invalid configuration: {e}"));
-    pub broadcast_tx: Sender<Message>,
-    pub broadcast_rx: Arc<Receiver<Message>>,
-    pub active_alerts: Arc<RwLock<Vec<SentinelAlert>>>,
-    pub shutdown_token: CancellationToken,
 
+    let config = Config::load();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -75,6 +77,28 @@ async fn main() -> Result<()> {
         .context("database migrations failed")?;
     tracing::info!("database connected and migrations up to date");
 
+    // Bootstrap admin (Q5): if BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD are
+    // set, upsert the admin row idempotently on every boot (rotating the env
+    // value rotates the password). Without these, no local admin exists until
+    // one is provisioned (future CLI / Option D provisioning).
+    if let (Some(email), Some(password)) =
+        (&config.bootstrap_admin_email, &config.bootstrap_admin_password)
+    {
+        match auth::password::hash_password(password) {
+            Ok(hash) => match db::repo::users::upsert_bootstrap_admin(&db_pool, email, &hash).await {
+                Ok(u) => tracing::info!(
+                    user_id = u.id,
+                    email = %u.email,
+                    "bootstrap admin ready (session-cookie auth enabled)"
+                ),
+                Err(e) => tracing::error!(error = %e, "failed to upsert bootstrap admin"),
+            },
+            Err(e) => tracing::error!(error = %e, "failed to hash bootstrap admin password"),
+        }
+    } else {
+        tracing::info!("no BOOTSTRAP_ADMIN_* env set; session-cookie auth has no local admin");
+    }
+
     // Valkey/Redis queue connection + health check.
     // Phase 1 keeps the server booting without a reachable Valkey — the queue
     // is not consumed yet; the scheduler/worker (Phase 2) will make it mandatory.
@@ -88,84 +112,66 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // API state: trait-object wiring over PostgreSQL + Valkey pools for the
-    // /api/v1 REST routes (see docs/tests.md — tests substitute in-memory fakes).
-    let api_state = ApiState {
-        alert_points: Arc::new(db::repo::PgAlertPointRepository::new(db_pool.clone())),
-        probe_results: Arc::new(db::repo::PgProbeResultStore::new(db_pool.clone())),
-        active_alerts: Arc::new(db::repo::PgActiveAlertStore::new(db_pool)),
-        queue: Arc::new(probe_queue),
-    };
-
-    // share state (demo WebSocket routes; cleanup planned for task 2.4)
-    let (tx, rx) = broadcast::channel(32);
-    let active_alerts: Vec<SentinelAlert> = vec![
-        SentinelAlert {
-            id: "1".to_string(),
-            atype: AlertType::New,
-            name: "test1".to_string(),
-            performance: 300,
-            expected: 150,
-            up: true,
-            reason: "slow performance".to_string(),
-            error: None,
-        },
-        SentinelAlert {
-            id: "2".to_string(),
-            atype: AlertType::New,
-            name: "test2".to_string(),
-            performance: 150,
-            expected: 150,
-            up: false,
-            reason: "service down".to_string(),
-            error: None,
-        },
-    ];
-    let ws_state = AppState {
-        broadcast_tx: Arc::new(Mutex::new(tx)),
-        broadcast_rx: Arc::new(Mutex::new(rx)),
-        active_alerts: Arc::new(Mutex::new(active_alerts)),
-    };
-
-    // build our application: REST API + WebSocket demo routes + static files
-    let api_router = api_router().with_state(api_state);
-    let ws_router = Router::new()
-        .route("/ws", get(ws_handler))
-        .route("/ws/sentinel", get(ws_sentinel_handler))
-        .with_state(ws_state);
-
-    let app = Router::new()
-        .merge(api_router)
-        .merge(ws_router)
-        .fallback(static_handler)
-        // logging so we can see whats going on
-        db: db_pool,
-        redis: redis_pool,
-    let config = Config::load();
-
     // Create broadcast channel for WebSocket messages
-    let (broadcast_tx, broadcast_rx) = broadcast::channel(32);
-
+    let (tx, _rx) = broadcast::channel(32);
     // Cancellation token for graceful shutdown
     let shutdown_token = CancellationToken::new();
     let app_state = AppState {
-        broadcast_tx: broadcast_tx,
-        broadcast_rx: Arc::new(broadcast_rx),
-        active_alerts: Arc::new(RwLock::new(vec![])),
+        broadcast_tx: Arc::new(tx),
+        db: db_pool.clone(),
+        redis: redis_pool.clone(),
+        evaluator: Arc::new(tokio::sync::Mutex::new(probe::evaluate::Evaluator::new(
+            config.probe_failure_threshold,
+        ))),
+        config: config.clone(),
         shutdown_token: shutdown_token.clone(),
     };
 
-    tokio::spawn(alert_workers::start_alert_generator(app_state.clone()));
+    let mut background_tasks = vec![tokio::spawn(scheduler::run_scheduler(app_state.clone()))];
+    for worker_id in 0..app_state.config.worker_concurrency.max(1) {
+        background_tasks.push(tokio::spawn(probe_worker::run_worker(
+            app_state.clone(),
+            worker_id,
+        )));
+    }
 
-    // Build the application router
+    // Request-ID middleware: every request gets an `x-request-id` (honoring an
+    // incoming one) that is echoed on the response and stamped into the trace
+    // span, so access logs, handler logs, and client reports can be correlated.
+    let request_id_span = |req: &axum::http::Request<_>| {
+        let request_id = req
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        tracing::info_span!(
+            "http_request",
+            request_id = %request_id,
+            method = %req.method(),
+            uri = %req.uri().path(),
+        )
+    };
+
+    // Build the application router.
+    //
+    // Auth (Option B): auth is enforced per-handler via the `CurrentUser`
+    // extractor (401 when absent) — the alert-points handlers, `/auth/me`, and
+    // the WS upgrade all declare it. `/auth/{login,logout}` are public. The SPA
+    // fallback stays public — the bundle has no secrets, and the frontend gates
+    // itself via `/auth/me` (401 → redirect to /login).
     let app = Router::new()
         .fallback(static_handler)
-        .route("/ws", get(ws_handler))
         .route("/ws/sentinel", get(ws_sentinel_handler))
+        .nest("/api/v1/alert-points", alert_points_api::router())
+        .nest("/api/v1/auth", auth_api::router())
         .with_state(app_state.clone())
         .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
+            tower::ServiceBuilder::new()
+                .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
+                    MakeRequestUuid,
+                ))
+                .layer(TraceLayer::new_for_http().make_span_with(request_id_span))
+                .layer(tower_http::request_id::PropagateRequestIdLayer::x_request_id()),
         );
 
     // bind using SERVER_HOST/SERVER_PORT from the environment
@@ -179,6 +185,7 @@ async fn main() -> Result<()> {
     tracing::info!("listening on {addr}");
 
     // Create a closure that handles the shutdown signal
+    let token_for_signal = shutdown_token.clone();
     let shutdown_signal = async move {
         let ctrl_c = async {
             signal::ctrl_c()
@@ -199,10 +206,10 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             _ = ctrl_c => {
-                shutdown_token.cancel();
+                token_for_signal.cancel();
             },
             _ = terminate => {
-                shutdown_token.cancel();
+                token_for_signal.cancel();
             },
         }
 
@@ -217,6 +224,29 @@ async fn main() -> Result<()> {
     .context("server error")?;
     .with_graceful_shutdown(shutdown_signal)
     .await?;
+
+    // Ensure background tasks see the token even if the server stopped for a
+    // reason other than a signal (idempotent if already cancelled).
+    shutdown_token.cancel();
+
+    // Wait for the scheduler/workers to finish their current work (they exit
+    // between jobs, never mid-probe). Bound the wait so a stuck probe cannot
+    // hang shutdown forever.
+    tracing::info!(
+        tasks = background_tasks.len(),
+        "waiting for background tasks to stop"
+    );
+    let drain = futures::future::join_all(background_tasks);
+    if tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("background tasks did not stop within 30s; continuing shutdown");
+    }
+
+    // Close the connection pools (sqlx waits for idle connections to close).
+    db_pool.close().await;
+    redis_pool.close();
 
     tracing::info!("Server shut down complete.");
     Ok(())

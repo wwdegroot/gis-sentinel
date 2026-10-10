@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE alert_points\n        SET last_checked_at = now()\n        WHERE id = $1\n        RETURNING last_checked_at AS \"last_checked_at!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_checked_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "9d2869360c29097afa1dd1f122fdb754d98a1b48fca3b6decf6599aee183469e"
+}
