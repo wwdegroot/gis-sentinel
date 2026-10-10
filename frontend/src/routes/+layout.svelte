@@ -17,6 +17,10 @@
         { href: '/settings', label: 'Settings' }
     ];
 
+    // Admin-only: user management (tasks 2.7 / 3.7). Viewers/unauthenticated
+    // never see the link — the endpoints are admin-only server-side, too.
+    const adminLinks = [{ href: '/users', label: 'Users' }];
+
     const isActive = (href: string) =>
         href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href);
 
@@ -67,6 +71,21 @@
                             {link.label}
                         </a>
                     {/each}
+                    {#if auth.isAdmin}
+                        {#each adminLinks as link (link.href)}
+                            <a
+                                href={link.href}
+                                aria-current={isActive(link.href) ? 'page' : undefined}
+                                class="rounded-md px-3 py-1.5 text-sm transition-colors {isActive(
+                                    link.href
+                                )
+                                    ? 'bg-surface-2 font-medium text-text'
+                                    : 'text-muted hover:bg-surface-2 hover:text-text'}"
+                            >
+                                {link.label}
+                            </a>
+                        {/each}
+                    {/if}
                 </div>
             </div>
             <div class="flex items-center gap-3">
@@ -118,6 +137,19 @@
                     {link.label}
                 </a>
             {/each}
+            {#if auth.isAdmin}
+                {#each adminLinks as link (link.href)}
+                    <a
+                        href={link.href}
+                        aria-current={isActive(link.href) ? 'page' : undefined}
+                        class="rounded-md px-3 py-1.5 text-sm transition-colors {isActive(link.href)
+                            ? 'bg-surface-2 font-medium text-text'
+                            : 'text-muted hover:bg-surface-2 hover:text-text'}"
+                    >
+                        {link.label}
+                    </a>
+                {/each}
+            {/if}
         </div>
     </nav>
 
