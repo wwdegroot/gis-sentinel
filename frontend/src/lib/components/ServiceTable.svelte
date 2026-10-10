@@ -7,6 +7,7 @@
         points,
         busyId = null,
         testingId = null,
+        editable = true,
         ontoggle,
         ontest,
         onedit,
@@ -15,6 +16,8 @@
         points: AlertPoint[];
         busyId?: string | null;
         testingId?: string | null;
+        /** False for the `viewer` role: hide the toggle + write actions (plan Q3-b). */
+        editable?: boolean;
         ontoggle: (point: AlertPoint, enabled: boolean) => void;
         ontest: (point: AlertPoint) => void;
         onedit: (point: AlertPoint) => void;
@@ -71,51 +74,61 @@
                             : 'never'}
                     </td>
                     <td class="px-4 py-3">
-                        <button
-                            type="button"
-                            role="switch"
-                            aria-checked={point.enabled}
-                            aria-label="Toggle enabled"
-                            disabled={isBusy(point.id)}
-                            onclick={() => ontoggle(point, !point.enabled)}
-                            class="relative h-5 w-9 rounded-full transition-colors {point.enabled
-                                ? 'bg-emerald-500'
-                                : 'bg-slate-400 dark:bg-slate-600'} disabled:opacity-50"
-                        >
-                            <span
-                                class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all {point.enabled
-                                    ? 'left-4.5'
-                                    : 'left-0.5'}"
-                            ></span>
-                        </button>
+                        {#if editable}
+                            <button
+                                type="button"
+                                role="switch"
+                                aria-checked={point.enabled}
+                                aria-label="Toggle enabled"
+                                disabled={isBusy(point.id)}
+                                onclick={() => ontoggle(point, !point.enabled)}
+                                class="relative h-5 w-9 rounded-full transition-colors {point.enabled
+                                    ? 'bg-emerald-500'
+                                    : 'bg-slate-400 dark:bg-slate-600'} disabled:opacity-50"
+                            >
+                                <span
+                                    class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all {point.enabled
+                                        ? 'left-4.5'
+                                        : 'left-0.5'}"
+                                ></span>
+                            </button>
+                        {:else}
+                            <span class="text-xs text-muted">
+                                {point.enabled ? 'Enabled' : 'Disabled'}
+                            </span>
+                        {/if}
                     </td>
                     <td class="px-4 py-3">
-                        <div class="flex justify-end gap-1">
-                            <button
-                                type="button"
-                                disabled={isBusy(point.id)}
-                                onclick={() => ontest(point)}
-                                class="rounded-md border border-line px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-50"
-                            >
-                                {testingId === point.id ? 'Testing…' : 'Test now'}
-                            </button>
-                            <button
-                                type="button"
-                                disabled={isBusy(point.id)}
-                                onclick={() => onedit(point)}
-                                class="rounded-md border border-line px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-50"
-                            >
-                                Edit
-                            </button>
-                            <button
-                                type="button"
-                                disabled={isBusy(point.id)}
-                                onclick={() => ondelete(point)}
-                                class="rounded-md border border-rose-500/40 px-2 py-1 text-xs text-rose-600 hover:bg-rose-500/10 disabled:opacity-50 dark:text-rose-400"
-                            >
-                                Delete
-                            </button>
-                        </div>
+                        {#if editable}
+                            <div class="flex justify-end gap-1">
+                                <button
+                                    type="button"
+                                    disabled={isBusy(point.id)}
+                                    onclick={() => ontest(point)}
+                                    class="rounded-md border border-line px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-50"
+                                >
+                                    {testingId === point.id ? 'Testing…' : 'Test now'}
+                                </button>
+                                <button
+                                    type="button"
+                                    disabled={isBusy(point.id)}
+                                    onclick={() => onedit(point)}
+                                    class="rounded-md border border-line px-2 py-1 text-xs hover:bg-surface-2 disabled:opacity-50"
+                                >
+                                    Edit
+                                </button>
+                                <button
+                                    type="button"
+                                    disabled={isBusy(point.id)}
+                                    onclick={() => ondelete(point)}
+                                    class="rounded-md border border-rose-500/40 px-2 py-1 text-xs text-rose-600 hover:bg-rose-500/10 disabled:opacity-50 dark:text-rose-400"
+                                >
+                                    Delete
+                                </button>
+                            </div>
+                        {:else}
+                            <div class="text-right text-xs text-muted">read-only</div>
+                        {/if}
                     </td>
                 </tr>
             {/each}

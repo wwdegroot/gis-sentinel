@@ -1,8 +1,14 @@
 /**
- * Typed REST client for `/api/v1/alert-points` (task 3.3/3.4).
+ * Typed REST client for `/api/v1/alert-points` + `/api/v1/auth` (tasks 3.3/3.4,
+ * auth plan §9).
  *
  * Errors: non-2xx responses throw `ApiError` parsed from the backend's
- * uniform `{ error: { code, message, details } }` body.
+ * uniform `{ error: { code, message, details } }` body; 401s additionally
+ * throw `UnauthorizedError` and fire the unauthorized handler (set by
+ * `auth.svelte.ts`) so the app can redirect to `/login` on session expiry.
+ *
+ * All calls are same-origin, so the session cookie rides along by default —
+ * no explicit `credentials` option is needed.
  */
 
 import type {
@@ -14,7 +20,9 @@ import type {
     NewAlertPoint,
     ProbeIncident,
     ProbeObservation,
-    ServiceType
+    ServiceType,
+    User,
+    LoginPayload
 } from './types';
 
 export class ApiError extends Error {
@@ -27,6 +35,18 @@ export class ApiError extends Error {
         super(message);
         this.name = 'ApiError';
     }
+}
+
+/**
+ * Hook fired whenever an API call receives a 401 (except on the login
+ * endpoint's own invalid-credentials response, which the caller handles).
+ * `auth.svelte.ts` installs the redirect-to-`/login` handler via
+ * `setUnauthorizedHandler`.
+ */
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+    unauthorizedHandler = handler;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -49,11 +69,45 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         } catch {
             // non-JSON error body — keep the HTTP fallbacks
         }
+        if (res.status === 401) {
+            unauthorizedHandler?.();
+            throw new UnauthorizedError(code, message, details);
+        }
         throw new ApiError(res.status, code, message, details);
     }
 
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
+}
+
+// ---------------------------------------------------------------------------
+// Auth (`/api/v1/auth`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown instead of `ApiError` on any 401, so callers can distinguish
+ * "not logged in / session expired" from other errors.
+ */
+export class UnauthorizedError extends ApiError {
+    constructor(code: string, message: string, details: Record<string, string> | null) {
+        super(401, code, message, details);
+        this.name = 'UnauthorizedError';
+    }
+}
+
+/** POST /api/v1/auth/login — sets the session cookie, returns the user. */
+export function login(payload: LoginPayload): Promise<User> {
+    return request('/api/v1/auth/login', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+/** POST /api/v1/auth/logout — deletes the session + clears the cookie (204). */
+export async function logout(): Promise<void> {
+    await request<void>('/api/v1/auth/logout', { method: 'POST' });
+}
+
+/** GET /api/v1/auth/me — the current user (throws `UnauthorizedError` when logged out). */
+export function me(): Promise<User> {
+    return request('/api/v1/auth/me');
 }
 
 export interface ListAlertPointsParams {
