@@ -7,13 +7,23 @@
 //!
 //! Connection pooling uses `deadpool-redis`; a `Pool` hands out connections
 //! on demand and transparently re-creates broken ones.
+//!
+//! The [`ProbeQueue`] trait decouples consumers (API handlers, future
+//! scheduler/worker) from Redis so tests can substitute the in-memory fake
+//! from [`queue::fake`] (see `docs/tests.md`).
 
 use crate::db::models::ServiceType;
+use async_trait::async_trait;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::time::Duration;
+use thiserror::Error;
 use uuid::Uuid;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fake;
+#[cfg(any(test, feature = "test-utils"))]
+pub use fake::FakeProbeQueue;
 
 /// Redis list key holding serialized [`ProbeJob`] payloads awaiting a worker.
 pub const PROBE_QUEUE_KEY: &str = "sentinel:probe_jobs";
@@ -28,40 +38,27 @@ const POOL_MAX_SIZE: usize = 10;
 pub type RedisPool = deadpool_redis::Pool;
 
 /// Errors surfaced by the queue layer.
-#[derive(Debug)]
+///
+/// `#[from]` wires proper `source()` chaining so downstream consumers
+/// (e.g. `ApiError::QueueUnavailable`) can log the inner cause.
+#[derive(Debug, Error)]
 pub enum QueueError {
     /// Connection acquisition or command execution failed.
-    Pool(deadpool_redis::PoolError),
+    #[error("redis queue error: {0}")]
+    Pool(#[from] deadpool_redis::PoolError),
     /// A dequeued payload could not be deserialized.
-    Serde(serde_json::Error),
+    #[error("invalid job payload: {0}")]
+    Serde(#[from] serde_json::Error),
+    /// Failure raised by a test fake via its failure-injection hook
+    /// (or any backend error that does not fit the other variants).
+    #[error("queue failure: {0}")]
+    Other(String),
 }
 
-impl fmt::Display for QueueError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            QueueError::Pool(e) => write!(f, "redis queue error: {e}"),
-            QueueError::Serde(e) => write!(f, "invalid job payload: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for QueueError {}
-
-impl From<deadpool_redis::PoolError> for QueueError {
-    fn from(e: deadpool_redis::PoolError) -> Self {
-        QueueError::Pool(e)
-    }
-}
-
+// Manual: thiserror cannot do transitive From (RedisError -> PoolError -> QueueError).
 impl From<redis::RedisError> for QueueError {
     fn from(e: redis::RedisError) -> Self {
         QueueError::Pool(e.into())
-    }
-}
-
-impl From<serde_json::Error> for QueueError {
-    fn from(e: serde_json::Error) -> Self {
-        QueueError::Serde(e)
     }
 }
 
@@ -83,9 +80,30 @@ pub struct ProbeJob {
     pub timeout_ms: i32,
 }
 
+/// Queue operations needed by producers (API on-demand checks, scheduler)
+/// and consumers (workers).
+#[async_trait]
+pub trait ProbeQueue: Send + Sync + std::fmt::Debug {
+    /// Verify the server is reachable (`PING` → `PONG`).
+    async fn health_check(&self) -> Result<(), QueueError>;
+
+    /// Push a probe job onto the queue (left end, so `BRPOP` yields FIFO order).
+    async fn enqueue_probe_job(&self, job: &ProbeJob) -> Result<u64, QueueError>;
+
+    /// Block up to `timeout` waiting for the next probe job.
+    /// Returns `None` on timeout without a pending job.
+    async fn dequeue_probe_job(&self, timeout: Duration) -> Result<Option<ProbeJob>, QueueError>;
+
+    /// Number of probe jobs currently waiting in the queue.
+    async fn queue_len(&self) -> Result<u64, QueueError>;
+
+    /// Remove all pending probe jobs (used by tests / maintenance).
+    async fn clear_queue(&self) -> Result<(), QueueError>;
+}
+
 /// Create a pooled Valkey/Redis connection pool.
 ///
-/// Connections are established lazily; use [`health_check`] to verify
+/// Connections are established lazily; use `health_check` to verify
 /// reachability.
 pub fn connect(redis_url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
     let mut cfg = deadpool_redis::Config::from_url(redis_url);
@@ -93,51 +111,58 @@ pub fn connect(redis_url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolE
     cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
 }
 
-/// Verify the server is reachable (`PING` → `PONG`).
-pub async fn health_check(pool: &RedisPool) -> Result<(), QueueError> {
-    let mut conn = pool.get().await?;
-    let pong: String = redis::cmd("PING").query_async(&mut conn).await?;
-    if pong != "PONG" {
-        return Err(redis::RedisError::from((
-            redis::ErrorKind::ResponseError,
-            "unexpected PING reply",
-        ))
-        .into());
-    }
-    Ok(())
+/// Redis-backed [`ProbeQueue`] implementation.
+#[derive(Debug, Clone)]
+pub struct RedisProbeQueue {
+    pool: RedisPool,
 }
 
-/// Push a probe job onto the queue (left end, so `BRPOP` yields FIFO order).
-pub async fn enqueue_probe_job(pool: &RedisPool, job: &ProbeJob) -> Result<u64, QueueError> {
-    let payload = serde_json::to_string(job)?;
-    let mut conn = pool.get().await?;
-    Ok(conn.lpush(PROBE_QUEUE_KEY, payload).await?)
-}
-
-/// Block up to `timeout` waiting for the next probe job.
-/// Returns `None` on timeout without a pending job.
-pub async fn dequeue_probe_job(
-    pool: &RedisPool,
-    timeout: Duration,
-) -> Result<Option<ProbeJob>, QueueError> {
-    let mut conn = pool.get().await?;
-    // BRPOP answers with a (queue_key, payload) pair
-    let raw: Option<(String, String)> = conn.brpop(PROBE_QUEUE_KEY, timeout.as_secs_f64()).await?;
-    match raw {
-        Some((_, payload)) => Ok(Some(serde_json::from_str(&payload)?)),
-        None => Ok(None),
+impl RedisProbeQueue {
+    pub fn new(pool: RedisPool) -> Self {
+        Self { pool }
     }
 }
 
-/// Number of probe jobs currently waiting in the queue.
-pub async fn queue_len(pool: &RedisPool) -> Result<u64, QueueError> {
-    let mut conn = pool.get().await?;
-    Ok(conn.llen(PROBE_QUEUE_KEY).await?)
-}
+#[async_trait]
+impl ProbeQueue for RedisProbeQueue {
+    async fn health_check(&self) -> Result<(), QueueError> {
+        let mut conn = self.pool.get().await?;
+        let pong: String = redis::cmd("PING").query_async(&mut conn).await?;
+        if pong != "PONG" {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "unexpected PING reply",
+            ))
+            .into());
+        }
+        Ok(())
+    }
 
-/// Remove all pending probe jobs (used by tests / maintenance).
-pub async fn clear_queue(pool: &RedisPool) -> Result<(), QueueError> {
-    let mut conn = pool.get().await?;
-    conn.del::<_, ()>(PROBE_QUEUE_KEY).await?;
-    Ok(())
+    async fn enqueue_probe_job(&self, job: &ProbeJob) -> Result<u64, QueueError> {
+        let payload = serde_json::to_string(job)?;
+        let mut conn = self.pool.get().await?;
+        Ok(conn.lpush(PROBE_QUEUE_KEY, payload).await?)
+    }
+
+    async fn dequeue_probe_job(&self, timeout: Duration) -> Result<Option<ProbeJob>, QueueError> {
+        let mut conn = self.pool.get().await?;
+        // BRPOP answers with a (queue_key, payload) pair
+        let raw: Option<(String, String)> =
+            conn.brpop(PROBE_QUEUE_KEY, timeout.as_secs_f64()).await?;
+        match raw {
+            Some((_, payload)) => Ok(Some(serde_json::from_str(&payload)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn queue_len(&self) -> Result<u64, QueueError> {
+        let mut conn = self.pool.get().await?;
+        Ok(conn.llen(PROBE_QUEUE_KEY).await?)
+    }
+
+    async fn clear_queue(&self) -> Result<(), QueueError> {
+        let mut conn = self.pool.get().await?;
+        conn.del::<_, ()>(PROBE_QUEUE_KEY).await?;
+        Ok(())
+    }
 }
